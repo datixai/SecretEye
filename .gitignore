@@ -6,6 +6,9 @@ backend/serviceAccountKey.json
 .env.local
 .env.*.local
 
+#.vs Code
+echo ".vscode/" >> .gitignore
+
 # ===========================
 # PYTHON — ALL VIRTUAL ENVS & CACHE
 # ===========================
