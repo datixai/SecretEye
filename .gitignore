@@ -1,0 +1,99 @@
+# ===========================
+# SECRETS — NEVER COMMIT
+# ===========================
+backend/serviceAccountKey.json
+.env
+.env.local
+.env.*.local
+
+# ===========================
+# PYTHON — ALL VIRTUAL ENVS & CACHE
+# ===========================
+venv/
+.venv/
+env/
+ENV/
+backend/venv/
+backend/.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+backend/.deepface/
+
+# ===========================
+# AI MODELS (too large for GitHub)
+# Place weapon.pt, fight.pt, facenet512_weights.h5 inside backend/model/
+# ===========================
+*.pt
+*.h5
+*.pb
+*.onnx
+*.weights
+
+# ===========================
+# NODE / JAVASCRIPT
+# ===========================
+node_modules/
+**/node_modules/
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+package-lock.json
+
+# ===========================
+# EXPO
+# ===========================
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# ===========================
+# NATIVE BUILD FOLDERS
+# ===========================
+/ios/
+/android/
+.kotlin/
+
+# ===========================
+# TYPESCRIPT
+# ===========================
+*.tsbuildinfo
+
+# ===========================
+# CERTIFICATES & KEYS
+# ===========================
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.pem
+
+# ===========================
+# OS FILES
+# ===========================
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+
+# ===========================
+# EDITOR
+# ===========================
+.vscode/settings.json
+.idea/
+
+# ===========================
+# MISC
+# ===========================
+.metro-health-check*
+app-example/
+*.log
