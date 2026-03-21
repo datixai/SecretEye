@@ -2,16 +2,11 @@
 # SECRETS — NEVER COMMIT
 # ===========================
 backend/serviceAccountKey.json
+lib/firebase.js
 .env
 .env.local
 .env.*.local
 
-# ===========================
-# EDITOR
-# ===========================
-.vscode/
-.idea/
-lib/firebase.js
 # ===========================
 # PYTHON — ALL VIRTUAL ENVS & CACHE
 # ===========================
