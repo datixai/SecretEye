@@ -1,19 +1,18 @@
 import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
-import { ScrollView, Text, TouchableOpacity, View, Switch, Alert, ActivityIndicator, Image } from "react-native";
-import { useState, useEffect } from "react";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { signOut } from "firebase/auth";
-import { db, auth } from "../../lib/firebase"; 
-import { doc, onSnapshot, updateDoc, setDoc, getDoc } from "firebase/firestore";
+import { doc, onSnapshot, setDoc, updateDoc } from "firebase/firestore";
+import { useEffect, useState } from "react";
+import { ActivityIndicator, Alert, Image, ScrollView, Switch, Text, TouchableOpacity, View } from "react-native";
+import { auth, db } from "../../lib/firebase";
 
 export default function HomeownerSettings() {
   const router = useRouter();
   const user = auth.currentUser;
   const userEmail = user?.email;
 
-  // States
   const [loading, setLoading] = useState(true);
   const [userData, setUserData] = useState({ fullName: "", faceReference: null });
   const [settings, setSettings] = useState({
@@ -24,38 +23,36 @@ export default function HomeownerSettings() {
   });
 
   useEffect(() => {
-    if (!userEmail) return;
+    // FIX: use uid as doc ID — signup.jsx writes doc(db, "users", uid)
+    if (!user?.uid) return;
 
-    // 1. Listen to Profile Data (from 'users' collection)
-    const userRef = doc(db, "users", userEmail);
-    const unsubUser = onSnapshot(userRef, (docSnap) => {
-      if (docSnap.exists()) {
-        setUserData(docSnap.data());
-      }
+    const userRef = doc(db, "users", user.uid);
+    const unsubUser = onSnapshot(userRef, (snap) => {
+      if (snap.exists()) setUserData(snap.data());
     });
 
-    // 2. Listen to Settings (from 'settings' collection)
-    const settingsRef = doc(db, "settings", userEmail);
-    const unsubSettings = onSnapshot(settingsRef, (docSnap) => {
-      if (docSnap.exists()) {
-        setSettings(docSnap.data());
+    const settingsRef = doc(db, "settings", user.uid);
+    const unsubSettings = onSnapshot(settingsRef, (snap) => {
+      if (snap.exists()) {
+        setSettings(snap.data());
       } else {
-        setDoc(settingsRef, settings);
+        setDoc(settingsRef, {
+          isFaceEnabled: true,
+          isWeaponAlertEnabled: true,
+          emailAlerts: true,
+          smsAlerts: false,
+        });
       }
       setLoading(false);
     });
 
-    return () => {
-      unsubUser();
-      unsubSettings();
-    };
-  }, [userEmail]);
+    return () => { unsubUser(); unsubSettings(); };
+  }, [user?.uid]);
 
   const toggleSetting = async (key, value) => {
     try {
-      const settingsRef = doc(db, "settings", userEmail);
-      await updateDoc(settingsRef, { [key]: value });
-    } catch (error) {
+      await updateDoc(doc(db, "settings", user.uid), { [key]: value });
+    } catch {
       Alert.alert("Sync Error", "Could not save preference.");
     }
   };
@@ -70,8 +67,10 @@ export default function HomeownerSettings() {
           try {
             await AsyncStorage.removeItem("rememberMe");
             await signOut(auth);
-            router.replace("/login");
-          } catch (error) {
+            // FIX: removed router.replace("/login") — _layout.jsx onAuthStateChanged
+            // fires automatically when auth becomes null and handles the redirect.
+            // Having both causes a navigation crash in Expo Router.
+          } catch {
             Alert.alert("Error", "Could not sign out.");
           }
         },
@@ -79,8 +78,16 @@ export default function HomeownerSettings() {
     ]);
   };
 
+  // FIX: faceReference is stored as raw base64 — needs data URI prefix
+  const getFaceUri = (ref) => {
+    if (!ref) return null;
+    if (ref.startsWith("data:")) return ref;
+    return `data:image/jpeg;base64,${ref}`;
+  };
+  const faceUri = getFaceUri(userData.faceReference);
+
   const SettingItem = ({ icon, title, subtitle, toggleKey, value, color = "#0891B2", isLast }) => (
-    <View className={`flex-row items-center justify-between py-5 ${!isLast ? 'border-b border-gray-50' : ''}`}>
+    <View className={`flex-row items-center justify-between py-5 ${!isLast ? "border-b border-gray-50" : ""}`}>
       <View className="flex-row items-center flex-1">
         <View className="p-3 rounded-2xl mr-4" style={{ backgroundColor: `${color}15` }}>
           <Ionicons name={icon} size={22} color={color} />
@@ -94,7 +101,7 @@ export default function HomeownerSettings() {
         trackColor={{ false: "#CBD5E1", true: color }}
         thumbColor={"#fff"}
         onValueChange={(val) => toggleSetting(toggleKey, val)}
-        value={value}
+        value={!!value}
       />
     </View>
   );
@@ -108,85 +115,50 @@ export default function HomeownerSettings() {
   return (
     <LinearGradient colors={["#F0F9FF", "#E0F2FE", "#FFFFFF"]} style={{ flex: 1 }}>
       <View className="flex-1 px-6 pt-16">
-        
+
         {/* Header */}
         <View className="flex-row items-center justify-between mb-8">
           <TouchableOpacity onPress={() => router.back()} className="p-3 rounded-2xl bg-white shadow-sm border border-gray-100">
             <Ionicons name="arrow-back" size={22} color="#0C4A6E" />
           </TouchableOpacity>
           <Text className="text-xl font-extrabold text-cyan-900">Security Settings</Text>
-          <View className="w-12" /> 
+          <View className="w-12" />
         </View>
 
         <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 40 }}>
-          
-          {/* Profile Section - Pulls faceReference from 'users' collection */}
-          <View className="bg-white rounded-[35px] p-6 shadow-xl shadow-cyan-900/5 border border-white mb-8 items-center flex-row">
-            <View className="w-16 h-16 rounded-full bg-cyan-600 items-center justify-center mr-4 shadow-lg shadow-cyan-500/50 overflow-hidden border-2 border-white">
-               {userData.faceReference ? (
-                 <Image 
-                   source={{ uri: userData.faceReference }} 
-                   className="w-16 h-16"
-                   resizeMode="cover"
-                 />
-               ) : (
-                 <Text className="text-white text-2xl font-black">
-                   {userData.fullName ? userData.fullName.charAt(0).toUpperCase() : userEmail?.charAt(0).toUpperCase()}
-                 </Text>
-               )}
+
+          {/* Profile */}
+          <View className="bg-white rounded-[35px] p-6 shadow-xl border border-white mb-8 items-center flex-row">
+            <View className="w-16 h-16 rounded-full bg-cyan-600 items-center justify-center mr-4 overflow-hidden border-2 border-white">
+              {faceUri ? (
+                <Image source={{ uri: faceUri }} style={{ width: 64, height: 64 }} resizeMode="cover" />
+              ) : (
+                <Text className="text-white text-2xl font-black">
+                  {userData.fullName ? userData.fullName.charAt(0).toUpperCase() : userEmail?.charAt(0).toUpperCase()}
+                </Text>
+              )}
             </View>
             <View>
-              <Text className="text-xl font-black text-slate-800">
-                {userData.fullName || "Home Owner"}
-              </Text>
+              <Text className="text-xl font-black text-slate-800">{userData.fullName || "Home Owner"}</Text>
               <Text className="text-slate-400 text-xs font-medium">{userEmail}</Text>
             </View>
           </View>
 
-          {/* AI Security Engine */}
+          {/* AI Engine */}
           <Text className="text-cyan-800 font-bold mb-3 ml-2 uppercase tracking-widest text-[10px]">AI Security Engine</Text>
-          <View className="bg-white rounded-[30px] px-6 shadow-lg shadow-cyan-900/5 border border-white mb-8">
-            <SettingItem 
-              icon="scan-outline" 
-              title="Face ID Recognition" 
-              subtitle="Identify trusted visitors automatically"
-              toggleKey="isFaceEnabled"
-              value={settings.isFaceEnabled}
-            />
-            <SettingItem 
-              icon="warning-outline" 
-              title="Weapon Detection" 
-              subtitle="Real-time alerts for dangerous objects"
-              toggleKey="isWeaponAlertEnabled"
-              value={settings.isWeaponAlertEnabled}
-              color="#EF4444"
-              isLast
-            />
+          <View className="bg-white rounded-[30px] px-6 shadow-lg border border-white mb-8">
+            <SettingItem icon="scan-outline" title="Face ID Recognition" subtitle="Identify trusted visitors automatically" toggleKey="isFaceEnabled" value={settings.isFaceEnabled} />
+            <SettingItem icon="warning-outline" title="Weapon Detection" subtitle="Real-time alerts for dangerous objects" toggleKey="isWeaponAlertEnabled" value={settings.isWeaponAlertEnabled} color="#EF4444" isLast />
           </View>
 
-          {/* Communication Channels */}
+          {/* Notifications */}
           <Text className="text-cyan-800 font-bold mb-3 ml-2 uppercase tracking-widest text-[10px]">Instant Notifications</Text>
-          <View className="bg-white rounded-[30px] px-6 shadow-lg shadow-cyan-900/5 border border-white mb-8">
-            <SettingItem 
-              icon="mail-outline" 
-              title="Email Reports" 
-              subtitle="Get security logs via email"
-              toggleKey="emailAlerts"
-              value={settings.emailAlerts}
-              color="#F59E0B"
-            />
-            <SettingItem 
-              icon="logo-whatsapp" 
-              title="WhatsApp Alerts" 
-              subtitle="Critical threats via WhatsApp"
-              toggleKey="smsAlerts"
-              value={settings.smsAlerts}
-              color="#25D366"
-              isLast
-            />
+          <View className="bg-white rounded-[30px] px-6 shadow-lg border border-white mb-8">
+            <SettingItem icon="mail-outline" title="Email Reports" subtitle="Get security logs via email" toggleKey="emailAlerts" value={settings.emailAlerts} color="#F59E0B" />
+            <SettingItem icon="logo-whatsapp" title="WhatsApp Alerts" subtitle="Critical threats via WhatsApp" toggleKey="smsAlerts" value={settings.smsAlerts} color="#25D366" isLast />
           </View>
 
-          {/* Info Banner */}
+          {/* Info banner */}
           <View className="bg-cyan-900 rounded-[25px] p-5 mb-8 flex-row items-center">
             <Ionicons name="shield-half-outline" size={24} color="#22D3EE" />
             <Text className="text-white text-[10px] font-bold ml-3 flex-1">
@@ -194,7 +166,7 @@ export default function HomeownerSettings() {
             </Text>
           </View>
 
-          {/* Logout */}
+          {/* Sign out */}
           <TouchableOpacity
             onPress={handleSignOut}
             className="flex-row items-center justify-center bg-red-50 py-5 rounded-[25px] border border-red-100 mb-10"

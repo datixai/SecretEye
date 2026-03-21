@@ -11,7 +11,7 @@ backend/serviceAccountKey.json
 # ===========================
 .vscode/
 .idea/
-
+lib/firebase.js
 # ===========================
 # PYTHON — ALL VIRTUAL ENVS & CACHE
 # ===========================
