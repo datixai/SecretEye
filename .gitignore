@@ -27,7 +27,7 @@ __pycache__/
 dist/
 build/
 backend/.deepface/
-
+.vscode
 # ===========================
 # AI MODELS (too large for GitHub)
 # Place weapon.pt, fight.pt, facenet512_weights.h5 inside backend/model/
