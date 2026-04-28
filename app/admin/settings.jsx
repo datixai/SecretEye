@@ -5,14 +5,17 @@ import { useRouter } from "expo-router";
 import { sendPasswordResetEmail, signOut } from "firebase/auth";
 import { doc, onSnapshot } from "firebase/firestore";
 import { useEffect, useState } from "react";
-import { ActivityIndicator, Alert, Image, ScrollView, Text, TouchableOpacity, View } from "react-native";
+import {
+  ActivityIndicator, Alert, Image, ScrollView,
+  Text, TouchableOpacity, View,
+} from "react-native";
 import HomeFooter from "../../components/HomeFooter";
 import { auth, db } from "../../lib/firebase";
 
 export default function AdminSettings() {
   const router = useRouter();
   const [adminData, setAdminData] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [loading,   setLoading]   = useState(true);
 
   useEffect(() => {
     const user = auth.currentUser;
@@ -27,24 +30,25 @@ export default function AdminSettings() {
   }, []);
 
   const handlePasswordReset = () => {
-    if (adminData?.email) {
-      Alert.alert("Reset Password", "Send a password reset link to your email?", [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Send Email",
-          onPress: async () => {
-            try {
-              await sendPasswordResetEmail(auth, adminData.email);
-              Alert.alert("Success", "Reset link sent to your inbox.");
-            } catch (error) {
-              Alert.alert("Error", error.message);
-            }
-          },
+    const email = adminData?.email;
+    if (!email) return;
+    Alert.alert("Reset Password", "Send a password reset link to your email?", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Send Email",
+        onPress: async () => {
+          try {
+            await sendPasswordResetEmail(auth, email);
+            Alert.alert("Success", "Reset link sent to your inbox.");
+          } catch (error) {
+            Alert.alert("Error", error.message);
+          }
         },
-      ]);
-    }
+      },
+    ]);
   };
 
+  // This is the working logout — simple and reliable
   const handleLogout = async () => {
     Alert.alert("Logout", "Are you sure you want to sign out?", [
       { text: "Cancel", style: "cancel" },
@@ -55,10 +59,9 @@ export default function AdminSettings() {
           try {
             await AsyncStorage.removeItem("rememberMe");
             await signOut(auth);
-            // FIX: removed router.replace("/login") — _layout.jsx onAuthStateChanged
-            // fires automatically when auth becomes null and handles the redirect.
-            // Having both causes a navigation crash in Expo Router.
+            // No router.replace — _layout.jsx onAuthStateChanged handles redirect
           } catch (error) {
+            console.error("Admin logout error:", error);
             Alert.alert("Logout Failed", error.message);
           }
         },
@@ -76,11 +79,17 @@ export default function AdminSettings() {
 
   return (
     <LinearGradient colors={["#F0F9FF", "#E0F2FE", "#BAE6FD", "#7DD3FC"]} style={{ flex: 1 }}>
-      <ScrollView className="px-6 pt-16" contentContainerStyle={{ paddingBottom: 120 }} showsVerticalScrollIndicator={false}>
-
+      <ScrollView
+        className="px-6 pt-16"
+        contentContainerStyle={{ paddingBottom: 120 }}
+        showsVerticalScrollIndicator={false}
+      >
         {/* Header */}
         <View className="flex-row items-center justify-between mb-8 pt-10">
-          <TouchableOpacity onPress={() => router.back()} className="p-3 rounded-full bg-white shadow-xl border border-gray-200">
+          <TouchableOpacity
+            onPress={() => router.back()}
+            className="p-3 rounded-full bg-white shadow-xl border border-gray-200"
+          >
             <Ionicons name="arrow-back" size={22} color="#0C4A6E" />
           </TouchableOpacity>
           <Text className="text-2xl font-bold text-gray-800 tracking-wide">Admin Command</Text>
@@ -105,9 +114,11 @@ export default function AdminSettings() {
           </View>
         </View>
 
-        <Text className="text-gray-500 font-bold text-[10px] uppercase tracking-widest ml-2 mb-4">Security & Access</Text>
+        <Text className="text-gray-500 font-bold text-[10px] uppercase tracking-widest ml-2 mb-4">
+          Security & Access
+        </Text>
 
-        {/* Password Reset */}
+        {/* Change Password */}
         <TouchableOpacity
           onPress={handlePasswordReset}
           className="bg-white rounded-3xl p-6 mb-4 shadow-xl border border-gray-200 flex-row items-center justify-between"
@@ -138,7 +149,7 @@ export default function AdminSettings() {
           <Ionicons name="chevron-forward" size={24} color="#9CA3AF" />
         </TouchableOpacity>
 
-        {/* Logout */}
+        {/* Logout — same button style as homeowner Sign Out */}
         <TouchableOpacity
           className="bg-red-500 rounded-[24px] py-5 items-center shadow-xl border-b-4 border-red-700"
           onPress={handleLogout}

@@ -1,29 +1,38 @@
 """
 =============================================================
   AI Security Hub — Flask Backend for Android App
-  v3.0  —  Production-grade POC
+  v3.1  —  Production-grade POC
 =============================================================
   Models    : weapon.pt  |  fight.pt (violence class only)  |  DeepFace Facenet512
   Stream    : MJPEG  →  /video_feed?userId=X&device=Y
+  Snapshot  : JPEG   →  /snapshot?userId=X&device=Y   ← NEW (React Native friendly)
   Firebase  : reads  devices/{doc}  (userId, name, ip, status)
               reads  users/{userId} (faceReference base64)
               writes detections/{}  (Weapon | Violence | Stranger)
 
   KEY DESIGN DECISIONS:
-  1. CONFIRMATION GATE  — detection must appear in CONFIRM_FRAMES_NEEDED
+  1. CONFIRMATION GATE  — YOLO detection must appear in CONFIRM_FRAMES_NEEDED
      consecutive inference frames before alert fires. Kills false-positive spam.
-  2. OBJECT TRACKING   — last confirmed YOLO box is held on screen for
-     TRACK_HOLD_SEC seconds so boxes are smooth, not jumping every frame.
-  3. HIGH CONFIDENCE   — weapon/violence conf raised to 0.70/0.65.
-  4. STREAM QUALITY    — CAP_PROP_BUFFERSIZE=1, resize-before-YOLO,
+  2. FACE CONFIRMATION  — FIX: face result now also gated by FACE_CONFIRM_NEEDED
+     consecutive Stranger frames before alert fires. Previously one bad DeepFace
+     frame = immediate Stranger alert → false alarm flood.
+  3. OBJECT TRACKING   — last confirmed YOLO box held on screen for TRACK_HOLD_SEC.
+  4. HIGH CONFIDENCE   — weapon/violence conf 0.70/0.65.
+  5. STREAM QUALITY    — CAP_PROP_BUFFERSIZE=1, resize-before-YOLO,
      DETECT_EVERY_N=4, FACE_EVERY_N=40, JPEG quality=65.
-  5. THREAD SAFETY     — ThreadPoolExecutor for Firebase writes (bounded),
+  6. SNAPSHOT ENDPOINT — /snapshot returns the latest processed frame as a single
+     JPEG. React Native's <Image> component cannot consume MJPEG (multipart HTTP
+     responses) — it fetches once, renders the first boundary, and stops. The app
+     polls /snapshot every ~300ms instead, which <Image> handles perfectly.
+  7. THREAD SAFETY     — ThreadPoolExecutor for Firebase writes (bounded),
      one FaceIDWorker thread per device, all queues maxsize=1.
-  6. ALERT COOLDOWN    — 60s per type per device.
+  8. ALERT COOLDOWN    — 60s per type per device.
+  9. WINDOWS COMPAT    — FIX: /tmp/ replaced with tempfile.gettempdir() so the
+     backend runs correctly on both Windows and Linux.
 =============================================================
 """
 
-import os, time, base64, threading, queue, logging, shutil
+import os, time, base64, threading, queue, logging, shutil, tempfile
 from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
@@ -106,19 +115,23 @@ log.info("✅ All models ready.")
 # ─────────────────────────────────────────────────────────────
 # Tunable constants
 # ─────────────────────────────────────────────────────────────
-WEAPON_CONF           = 0.70   # raised — model must be very sure before flagging
+WEAPON_CONF           = 0.70
 VIOLENCE_CONF         = 0.65
-CONFIRM_FRAMES_NEEDED = 3      # consecutive hits  before first alert fires
+CONFIRM_FRAMES_NEEDED = 3      # consecutive YOLO hits before weapon/violence alert
 CONFIRM_EXIT_FRAMES   = 5      # consecutive misses before label un-confirms
-                               # (prevents re-trigger on single missed frame)
+FACE_CONFIRM_NEEDED   = 2      # FIX: consecutive Stranger results before face alert
+                               # Previously 1 bad DeepFace frame = immediate alert
 FACE_THRESH           = 0.38   # cosine distance — lower = stricter
-TRACK_HOLD_SEC        = 3.0    # keep tracking box on screen for N seconds
-ALERT_COOLDOWN_SEC    = 60     # min gap between same-type alerts per device
-DETECT_EVERY_N        = 4      # run YOLO every N frames
-FACE_EVERY_N          = 40     # run face ID every N frames
-YOLO_INPUT_WIDTH      = 640    # resize frame to this width before YOLO
-STREAM_FPS_CAP        = 0.033  # ~30 fps MJPEG yield rate
-STREAM_QUALITY        = 65     # JPEG quality to Android
+TRACK_HOLD_SEC        = 3.0
+ALERT_COOLDOWN_SEC    = 60
+DETECT_EVERY_N        = 4
+FACE_EVERY_N          = 40
+YOLO_INPUT_WIDTH      = 640
+STREAM_FPS_CAP        = 0.1    # FIX: was 0.033 (30fps) — too aggressive for WiFi.
+                               # 0.1 = 10fps which is stable on local networks.
+                               # /snapshot polling at 300ms is the preferred
+                               # method for React Native anyway.
+STREAM_QUALITY        = 65
 
 # ─────────────────────────────────────────────────────────────
 # Runtime state
@@ -149,7 +162,13 @@ def get_homeowner_ref(user_id: str):
         if img_bgr is None:
             log.error(f"[{user_id}] Could not decode faceReference.")
             return None, None
-        tmp_path = f"/tmp/ref_{user_id}.jpg"
+
+        # FIX: use tempfile.gettempdir() instead of hardcoded /tmp/
+        # /tmp/ is Unix-only and does not exist on Windows, causing a crash.
+        # tempfile.gettempdir() returns the correct temp directory for any OS:
+        #   Linux/macOS → /tmp
+        #   Windows     → C:\Users\<user>\AppData\Local\Temp
+        tmp_path = os.path.join(tempfile.gettempdir(), f"ref_{user_id}.jpg")
         cv2.imwrite(tmp_path, img_bgr)
         log.info(f"[{user_id}] Homeowner reference ready {img_bgr.shape}.")
         return img_bgr, tmp_path
@@ -190,66 +209,43 @@ def save_alert(user_id: str, device_name: str, alert_type: str,
 
 
 # ─────────────────────────────────────────────────────────────
-# Confirmation gate
+# Confirmation gate (YOLO — weapon / violence)
 # ─────────────────────────────────────────────────────────────
 
 class ConfirmationGate:
     """
-    Two-stage gate that eliminates false-positive alert spam:
-
-    STAGE 1 — Entry gate (confirm before first alert):
-      Detection must appear in CONFIRM_FRAMES_NEEDED consecutive inference
-      frames before it is treated as real. A single bad frame can never
-      trigger an alert.
-
-    STAGE 2 — Exit hysteresis (don't un-confirm on a single miss):
-      Once confirmed, a label is only removed when it has been ABSENT for
-      CONFIRM_EXIT_FRAMES consecutive inference frames. One missed frame
-      (blur, occlusion, skip) does NOT reset the gate — which was the root
-      cause of the every-second alert loop:
-        detect×3 → confirmed → alert → miss×1 → un-confirmed → counter=0
-        → detect×3 → confirmed → alert → miss×1 → ...  (repeats forever)
-
-    ALERT FIRE RULE:
-      newly_confirmed only contains a label on the FIRST time it crosses
-      the entry threshold. It is never re-added while already confirmed.
-      Combined with the 60s cooldown in save_alert this gives hard guarantee
-      of at most one alert per 60s per label per device.
+    Two-stage gate for YOLO labels:
+    STAGE 1 — Entry: detection must appear in CONFIRM_FRAMES_NEEDED consecutive
+              inference frames before being treated as real.
+    STAGE 2 — Exit hysteresis: once confirmed, label is only removed after
+              CONFIRM_EXIT_FRAMES consecutive misses (prevents re-trigger on
+              a single missed frame).
     """
     def __init__(self,
                  needed:      int = CONFIRM_FRAMES_NEEDED,
                  exit_frames: int = CONFIRM_EXIT_FRAMES):
         self._needed      = needed
         self._exit_frames = exit_frames
-        self._hit_counter : dict = {}   # consecutive hits
-        self._miss_counter: dict = {}   # consecutive misses (only counts when confirmed)
+        self._hit_counter : dict = {}
+        self._miss_counter: dict = {}
         self._confirmed   : set  = set()
 
     def update(self, detected_labels: list) -> list:
-        """
-        Feed the set of labels detected in this inference frame.
-        Returns labels that just became newly confirmed (first time only).
-        """
         newly_confirmed = []
         detected_set    = set(detected_labels)
 
-        # ── labels present this frame ──
         for label in detected_set:
             self._hit_counter[label]  = self._hit_counter.get(label, 0) + 1
-            self._miss_counter[label] = 0   # reset miss streak
-
+            self._miss_counter[label] = 0
             if (self._hit_counter[label] >= self._needed
                     and label not in self._confirmed):
                 self._confirmed.add(label)
                 newly_confirmed.append(label)
 
-        # ── labels absent this frame ──
         for label in list(self._hit_counter):
             if label not in detected_set:
-                self._hit_counter[label] = 0   # reset entry counter
-
+                self._hit_counter[label] = 0
                 if label in self._confirmed:
-                    # Only un-confirm after sustained absence
                     self._miss_counter[label] = self._miss_counter.get(label, 0) + 1
                     if self._miss_counter[label] >= self._exit_frames:
                         self._confirmed.discard(label)
@@ -267,42 +263,21 @@ class ConfirmationGate:
 
 
 # ─────────────────────────────────────────────────────────────
-# Tracked box  (no contrib needed — pure box-hold approach)
+# Tracked box
 # ─────────────────────────────────────────────────────────────
 
 class TrackedBox:
-    """
-    Holds a detection box on screen for TRACK_HOLD_SEC seconds after the
-    last YOLO confirmation.  No opencv-contrib dependency needed.
-
-    Why CSRT was removed:
-      cv2.TrackerCSRT_create() lives in opencv-contrib-python, NOT in the
-      standard opencv-python package.  Installing contrib just for one
-      tracker would add ~200 MB and break many existing setups.
-
-    What we do instead:
-      When YOLO detects the object we store the box coordinates + timestamp.
-      On every frame we draw that box.  When YOLO re-detects we update the
-      coordinates (smooth natural update).  When TRACK_HOLD_SEC seconds pass
-      without a new YOLO hit the box expires and disappears.
-
-      Result: boxes stay visible and stable for 3 seconds after each YOLO
-      confirmation — same user-visible behaviour, zero extra dependencies.
-    """
     def __init__(self, frame: np.ndarray, box_xyxy, label: str, color: tuple):
         x1, y1, x2, y2 = [int(v) for v in box_xyxy]
         self.label     = label
         self.color     = color
         self.last_seen = time.time()
-        # Store as (x, y, w, h) for cv2.rectangle compatibility
         self._box      = (x1, y1, x2 - x1, y2 - y1)
 
     def update(self, frame: np.ndarray):
-        # No-op — we don't do pixel tracking, just time-based hold
         pass
 
     def refresh(self, frame: np.ndarray, box_xyxy):
-        """Called every time YOLO re-detects this label — updates box + timestamp."""
         x1, y1, x2, y2 = [int(v) for v in box_xyxy]
         self._box      = (x1, y1, x2 - x1, y2 - y1)
         self.last_seen = time.time()
@@ -328,8 +303,7 @@ class TrackedBox:
 class FaceIDWorker:
     """
     Dedicated background thread for DeepFace.verify.
-    Camera loop submits frames non-blocking; results are collected non-blocking.
-    Pipeline: Haar cascade check → BGR→RGB → DeepFace verify (Facenet512, cosine)
+    Camera loop submits frames non-blocking; results collected non-blocking.
     """
     def __init__(self, ref_img_path: str, threshold: float = FACE_THRESH):
         self.ref_path  = ref_img_path
@@ -449,16 +423,6 @@ def refresh_or_create_tracker(tracked_boxes: list, frame: np.ndarray,
 
 def camera_worker(user_id: str, device_name: str,
                   stream_ip: str, stop_event: threading.Event):
-    """
-    Core loop. Every frame:
-      - Read from stream  (auto-reconnect with exponential back-off)
-      - Every DETECT_EVERY_N  → YOLO weapon + violence → ConfirmationGate
-           → newly confirmed  → save Firebase alert + TrackedBox
-      - Every FACE_EVERY_N    → submit to FaceIDWorker
-           → pick up result   → update face state
-      - Every frame           → advance TrackedBoxes (CSRT), expire old ones
-      - Draw all boxes + HUD  → store in latest_frames for MJPEG
-    """
     storage_key  = f"{user_id}_{device_name}"
     cooldown_map : dict = {}
 
@@ -477,6 +441,11 @@ def camera_worker(user_id: str, device_name: str,
     frame_count   = 0
     gate          = ConfirmationGate(CONFIRM_FRAMES_NEEDED)
     tracked_boxes : list = []
+
+    # FIX: face confirmation counter — require FACE_CONFIRM_NEEDED consecutive
+    # Stranger results before firing alert. Previously one bad DeepFace frame
+    # (blur, partial occlusion, lighting change) immediately triggered an alert.
+    face_stranger_count = 0
 
     cap = cv2.VideoCapture(stream_url)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -497,10 +466,10 @@ def camera_worker(user_id: str, device_name: str,
         reconnect_delay = 2
         frame_count    += 1
         display         = frame.copy()
-        run_detection   = (frame_count % DETECT_EVERY_N == 0)
+        run_detection   = (frame_count % DETECT_EVERY_N  == 0)
         run_face        = face_worker_obj is not None and (frame_count % FACE_EVERY_N == 0)
 
-        # ── face result ───────────────────────────────────────
+        # ── face result ──────────────────────────────────────────────────────
         if face_worker_obj:
             result = face_worker_obj.get_result()
             if result:
@@ -508,17 +477,26 @@ def camera_worker(user_id: str, device_name: str,
                 face_label = new_label
                 face_dist  = new_dist
                 face_box   = new_box if new_label != "No Face" else None
-                if face_label == "Stranger":
-                    save_alert(user_id, device_name, "Stranger", display, cooldown_map)
 
-        # ── YOLO inference ────────────────────────────────────
+                # FIX: gate face alerts — require consecutive Stranger frames
+                if face_label == "Stranger":
+                    face_stranger_count += 1
+                    if face_stranger_count >= FACE_CONFIRM_NEEDED:
+                        save_alert(user_id, device_name, "Stranger", display, cooldown_map)
+                        face_stranger_count = 0  # reset after confirmed alert fires
+                        log.info(f"[{device_name}] ✔ CONFIRMED: Stranger after "
+                                 f"{FACE_CONFIRM_NEEDED} frames → alert sent")
+                else:
+                    # Any non-Stranger result resets the gate
+                    face_stranger_count = 0
+
+        # ── YOLO inference ───────────────────────────────────────────────────
         if run_detection:
             yolo_frame   = resize_for_yolo(frame)
             raw_detected = []
             w_res        = None
             v_boxes      = []
 
-            # Run models — only collect labels here, NO box drawing yet
             try:
                 w_res = weapon_model.predict(yolo_frame, conf=WEAPON_CONF,
                                              verbose=False, iou=0.45)
@@ -540,14 +518,12 @@ def camera_worker(user_id: str, device_name: str,
             except Exception as e:
                 log.error(f"[{device_name}] Violence: {e}")
 
-            # Feed gate — alert fires ONCE on first confirmation only
             newly_confirmed = gate.update(raw_detected)
             for label in newly_confirmed:
                 save_alert(user_id, device_name, label, display, cooldown_map)
-                log.info(f"[{device_name}] ✔ CONFIRMED: {label} after {CONFIRM_FRAMES_NEEDED} frames → alert sent")
+                log.info(f"[{device_name}] ✔ CONFIRMED: {label} after "
+                         f"{CONFIRM_FRAMES_NEEDED} frames → alert sent")
 
-            # Create/refresh tracked boxes ONLY for confirmed labels
-            # Unconfirmed detections are completely invisible — no box drawn
             if gate.is_confirmed("Weapon") and w_res is not None and len(w_res[0].boxes) > 0:
                 for box in w_res[0].boxes:
                     refresh_or_create_tracker(tracked_boxes, frame,
@@ -557,12 +533,11 @@ def camera_worker(user_id: str, device_name: str,
                     refresh_or_create_tracker(tracked_boxes, frame,
                                                box.xyxy[0], "Violence", (0, 100, 255))
 
-        # ── face ID submit ────────────────────────────────────
+        # ── face ID submit ───────────────────────────────────────────────────
         if run_face:
             face_worker_obj.submit(frame.copy())
 
-        # ── advance + draw tracked boxes ─────────────────────
-        # Only draw box if: not expired AND gate has confirmed the label
+        # ── advance + draw tracked boxes ─────────────────────────────────────
         active_threats = []
         alive = []
         for tb in tracked_boxes:
@@ -570,19 +545,19 @@ def camera_worker(user_id: str, device_name: str,
                 continue
             tb.update(display)
             if gate.is_confirmed(tb.label):
-                tb.draw(display)               # box only visible when confirmed
+                tb.draw(display)
                 active_threats.append(tb.label)
-            alive.append(tb)                   # keep in list even if unconfirmed (tracking continues)
+            alive.append(tb)
         tracked_boxes = alive
 
-        # ── face box ──────────────────────────────────────────
+        # ── face box ─────────────────────────────────────────────────────────
         if face_box and face_label not in ("No Face", "Scanning…"):
             display = draw_face_box(display, face_box, face_label, face_dist)
 
-        # ── HUD ───────────────────────────────────────────────
+        # ── HUD ──────────────────────────────────────────────────────────────
         display = draw_hud(display, face_label, list(dict.fromkeys(active_threats)))
 
-        # ── store ─────────────────────────────────────────────
+        # ── store latest frame ───────────────────────────────────────────────
         latest_frames[storage_key] = display
 
     cap.release()
@@ -649,16 +624,21 @@ def health():
         "status": "online", "active_workers": active,
         "model_classes": {"weapon": weapon_model.names, "fight": fight_model.names},
         "config": {
-            "weapon_conf": WEAPON_CONF, "violence_conf": VIOLENCE_CONF,
-            "confirm_frames": CONFIRM_FRAMES_NEEDED,
-            "track_hold_sec": TRACK_HOLD_SEC,
-            "alert_cooldown_sec": ALERT_COOLDOWN_SEC,
+            "weapon_conf":          WEAPON_CONF,
+            "violence_conf":        VIOLENCE_CONF,
+            "confirm_frames":       CONFIRM_FRAMES_NEEDED,
+            "face_confirm_needed":  FACE_CONFIRM_NEEDED,
+            "track_hold_sec":       TRACK_HOLD_SEC,
+            "alert_cooldown_sec":   ALERT_COOLDOWN_SEC,
+            "stream_fps_cap":       1 / STREAM_FPS_CAP,
         },
     })
 
 
 @app.route("/video_feed")
 def video_feed():
+    """Legacy MJPEG stream — kept for browser/VLC clients. React Native app
+    should use /snapshot instead (polling is more reliable on mobile)."""
     user_id     = request.args.get("userId", "").strip()
     device_name = request.args.get("device",  "").strip()
     if not user_id or not device_name:
@@ -691,6 +671,48 @@ def video_feed():
     return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+@app.route("/snapshot")
+def snapshot():
+    """
+    FIX: NEW endpoint for React Native app.
+
+    Returns the latest AI-processed frame as a single JPEG image.
+    React Native's <Image> component cannot handle MJPEG (multipart HTTP) —
+    it fetches the URL once, parses the first boundary as a JPEG, and never
+    updates again. Polling this endpoint at ~300ms intervals gives a stable
+    live feed that Image handles correctly.
+
+    The app uses t=Date.now() as a query param to prevent caching.
+    Response headers also disable all caching layers.
+    """
+    user_id     = request.args.get("userId", "").strip()
+    device_name = request.args.get("device",  "").strip()
+    if not user_id or not device_name:
+        return jsonify({"error": "userId and device params required"}), 400
+
+    key = f"{user_id}_{device_name}"
+    ensure_worker_running(user_id, device_name)
+
+    frame = latest_frames.get(key)
+    if frame is None:
+        # Return a connecting placeholder
+        ph = np.zeros((240, 320, 3), dtype=np.uint8)
+        cv2.putText(ph, "Connecting...", (55, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (150, 150, 150), 2)
+        cv2.putText(ph, "AI Hub starting...", (35, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 100, 100), 1)
+        _, buf = cv2.imencode(".jpg", ph)
+    else:
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, STREAM_QUALITY])
+
+    response = Response(buf.tobytes(), mimetype="image/jpeg")
+    # Hard-disable all caching so every poll gets a fresh frame
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"]        = "no-cache"
+    response.headers["Expires"]       = "0"
+    return response
+
+
 @app.route("/start_device", methods=["POST"])
 def start_device():
     data = request.get_json(silent=True) or {}
@@ -711,6 +733,82 @@ def stop_device():
     return jsonify({"stopped": True, "device": device_name})
 
 
+@app.route("/upload-video", methods=["POST"])
+def upload_video():
+    """
+    FIX: NEW endpoint — previously called by devices.jsx but missing from backend.
+    Accepts a video file uploaded from the mobile camera, runs AI analysis on it
+    in a background thread, and writes any detections to Firestore.
+    """
+    # FIX: was reading "userEmail" — detections use userId (uid) consistently
+    user_id = request.form.get("userId", "").strip()
+    if not user_id:
+        return jsonify({"error": "userId required"}), 400
+
+    if "video" not in request.files:
+        return jsonify({"error": "No video file in request"}), 400
+
+    video_file = request.files["video"]
+
+    # Save to OS temp dir (cross-platform — works on Windows and Linux)
+    tmp_path = os.path.join(
+        tempfile.gettempdir(),
+        f"upload_{user_id}_{int(time.time())}.mp4"
+    )
+    video_file.save(tmp_path)
+    log.info(f"[upload-video] Saved {tmp_path} for user {user_id}")
+
+    def process_in_background():
+        try:
+            cap         = cv2.VideoCapture(tmp_path)
+            frame_count = 0
+            gate        = ConfirmationGate(CONFIRM_FRAMES_NEEDED)
+            cooldown    = {}
+
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_count += 1
+
+                if frame_count % DETECT_EVERY_N == 0:
+                    yolo_frame   = resize_for_yolo(frame)
+                    raw_detected = []
+
+                    try:
+                        w_res = weapon_model.predict(yolo_frame, conf=WEAPON_CONF, verbose=False)
+                        if w_res and len(w_res[0].boxes) > 0:
+                            raw_detected.append("Weapon")
+                    except Exception as e:
+                        log.debug(f"[upload-video] weapon: {e}")
+
+                    try:
+                        f_res = fight_model.predict(
+                            yolo_frame, conf=VIOLENCE_CONF, verbose=False,
+                            classes=[VIOLENCE_CLASS_ID] if VIOLENCE_CLASS_ID is not None else None,
+                        )
+                        if any(int(b.cls[0]) == VIOLENCE_CLASS_ID for b in f_res[0].boxes
+                               if VIOLENCE_CLASS_ID is not None):
+                            raw_detected.append("Violence")
+                    except Exception as e:
+                        log.debug(f"[upload-video] violence: {e}")
+
+                    for label in gate.update(raw_detected):
+                        save_alert(user_id, "Mobile Upload", label, frame, cooldown)
+
+            cap.release()
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            log.info(f"[upload-video] Done — {frame_count} frames for user {user_id}")
+        except Exception as e:
+            log.error(f"[upload-video] processing error: {e}")
+
+    _alert_pool.submit(process_in_background)
+    return jsonify({"status": "processing", "message": "Video submitted for AI analysis"})
+
+
 @app.route("/status")
 def status():
     return jsonify({k: {"alive": t.is_alive(), "has_frame": k in latest_frames}
@@ -721,5 +819,5 @@ def status():
 # Entry point
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("🚀 AI Security Hub v3.0 — 0.0.0.0:5000")
+    log.info("🚀 AI Security Hub v3.1 — 0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

@@ -1,12 +1,31 @@
+import { Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
+import { collection, onSnapshot, query, where } from "firebase/firestore";
+import { useEffect, useState } from "react";
 import { ScrollView, Text, TouchableOpacity, View } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
 import DashboardCard from "../../components/DashboardCard";
 import HomeFooter from "../../components/HomeFooter";
+import { db } from "../../lib/firebase";
 
 export default function AdminDashboard() {
   const router = useRouter();
+
+  // FIX: fetch real unread alert count from Firestore instead of hardcoding "3"
+  const [unreadAlerts, setUnreadAlerts] = useState(0);
+
+  useEffect(() => {
+    const q = query(
+      collection(db, "emergency_alerts"),
+      where("status", "==", "UNREAD")
+    );
+    const unsub = onSnapshot(q, (snap) => {
+      setUnreadAlerts(snap.size);
+    }, (err) => {
+      console.error("Admin dashboard alert count error:", err);
+    });
+    return () => unsub();
+  }, []);
 
   return (
     <LinearGradient
@@ -18,7 +37,7 @@ export default function AdminDashboard() {
         contentContainerStyle={{ paddingBottom: 100 }}
         showsVerticalScrollIndicator={false}
       >
-        {/* Attractive Header */}
+        {/* Header */}
         <View className="mb-8 pt-10">
           <View className="px-6 py-6 bg-white rounded-3xl shadow-xl border border-gray-200">
             <Text className="text-4xl font-extrabold text-cyan-800 tracking-wide">
@@ -42,29 +61,28 @@ export default function AdminDashboard() {
           <Ionicons name="settings-outline" size={26} color="#0C4A6E" />
         </TouchableOpacity>
 
-        {/* Status Tags */}
+        {/* Status Tags — FIX: alert count is now live from Firestore */}
         <View className="flex-row gap-3 mb-8">
           <View className="px-4 py-2 rounded-full bg-cyan-500 shadow-lg">
             <Text className="text-white text-sm font-bold tracking-wide">
               🔒 System Armed
             </Text>
           </View>
-          <View className="px-4 py-2 rounded-full bg-red-500 shadow-lg">
+          <TouchableOpacity
+            onPress={() => router.push("/admin/panic")}
+            className="px-4 py-2 rounded-full bg-red-500 shadow-lg"
+          >
             <Text className="text-white text-sm font-bold tracking-wide">
-              🚨 3 New Alerts
+              🚨 {unreadAlerts > 0 ? `${unreadAlerts} New Alert${unreadAlerts !== 1 ? "s" : ""}` : "No Alerts"}
             </Text>
-          </View>
+          </TouchableOpacity>
         </View>
 
-        {/* Dashboard Cards with colors and same size as HomeownerDashboard */}
+        {/* Dashboard Cards */}
         <DashboardCard
           icon={
             <View className="p-4 rounded-2xl bg-cyan-500 shadow-lg">
-              <Ionicons
-                name="shield-checkmark-outline"
-                size={28}
-                color="white"
-              />
+              <Ionicons name="shield-checkmark-outline" size={28} color="white" />
             </View>
           }
           title="System Control"
@@ -79,7 +97,7 @@ export default function AdminDashboard() {
             </View>
           }
           title="Manage Users"
-          subtitle="3 Homeowners, 5 Guests"
+          subtitle="View & manage all homeowners"
           onPress={() => router.push("/admin/manageUsers")}
         />
 
@@ -90,13 +108,12 @@ export default function AdminDashboard() {
             </View>
           }
           title="Reports & Alerts"
-          subtitle="2 New Alerts"
+          subtitle={unreadAlerts > 0 ? `${unreadAlerts} unread alert${unreadAlerts !== 1 ? "s" : ""}` : "No new alerts"}
           onPress={() => router.push("/admin/reports-and-alerts")}
         />
-        
+
       </ScrollView>
 
-      {/* Sticky Footer */}
       <View className="absolute bottom-0 left-0 right-0">
         <HomeFooter active="Home" />
       </View>
