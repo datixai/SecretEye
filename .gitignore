@@ -28,6 +28,7 @@ dist/
 build/
 backend/.deepface/
 .vscode
+
 # ===========================
 # AI MODELS (too large for GitHub)
 # Place weapon.pt, fight.pt, facenet512_weights.h5 inside backend/model/
@@ -59,8 +60,8 @@ expo-env.d.ts
 # ===========================
 # NATIVE BUILD FOLDERS
 # ===========================
-/ios/
 /android/
+/ios/
 .kotlin/
 
 # ===========================
@@ -98,3 +99,8 @@ ehthumbs.db
 .metro-health-check*
 app-example/
 *.log
+
+# ===========================
+# ML MODELS
+# ===========================
+ml_models/

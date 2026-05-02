@@ -1,0 +1,7 @@
+flask
+flask-cors
+firebase-admin
+ultralytics
+deepface
+opencv-python-headless
+numpy
