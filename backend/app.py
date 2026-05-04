@@ -1,78 +1,74 @@
 """
 =============================================================
-  SecretEye — AI Security Hub  v5.0
+  SecretEye — AI Security Hub  v6.0
 =============================================================
-  WEB LOGIN ADDED:
-    Open http://PC_IP:5000 in browser
-    Enter your SecretEye email + password (same as mobile app)
-    Flask verifies against Firebase Auth via REST API
-    Only YOUR devices start — no other users' cameras touched
-    /monitor shows only YOUR streams and detections
+  Run:
+      cd D:\SecretEye\backend
+      venv\Scripts\activate
+      python app.py
 
-  DUAL STREAM per device:
-    raw_frames[key]    → /raw-snapshot  (mobile app clean preview)
-    latest_frames[key] → /snapshot + /monitor (AI boxes + HUD)
+  Open: http://YOUR_PC_IP:5000
 
-  Endpoints:
-    GET/POST /           — login page
-    GET      /logout     — logout
-    GET      /monitor    — web dashboard (protected)
-    GET      /recent-detections
-    GET      /raw-snapshot
-    GET      /snapshot
-    GET      /video_feed
-    POST     /start_device
-    POST     /stop_device
-    POST     /upload-video
-    GET      /status
-    GET      /health
+  FEATURES:
+    - Web login with Firebase Auth (same creds as mobile app)
+    - Video upload → AI detection → evidence to Firestore
+    - Live PC webcam → face recognition + weapon/violence → alerts
+    - Per-user Firestore writes (detections, evidence frames)
+    - Output video playable in browser + saved to runs/detect/
+
+  FACE RECOGNITION:
+    Add images to backend/faces/ folder
+    Filename = person name: xyz.jpg → "xyz"
+    Unknown faces → "Stranger" alert sent to Firestore
+
+  MODELS:
+    model/weapon.pt   → Gun detection
+    model/weapon1.pt  → Gun + Knife + Grenade
+    model/fight.pt    → Violence detection
+    face_recognition  → Face ID vs faces/ folder
 =============================================================
 """
 
-import os, time, base64, threading, queue, logging, shutil, tempfile, requests
+import os, time, base64, threading, queue, uuid, logging, shutil, tempfile, glob, requests
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
+from datetime import datetime
 import cv2
 import numpy as np
-from flask import (Flask, Response, jsonify, redirect, render_template_string,
-                   request, session, url_for)
+from flask import (Flask, Response, jsonify, redirect,
+                   render_template_string, request, session, url_for, send_file)
 from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, firestore
 from ultralytics import YOLO
-from deepface import DeepFace
+import face_recognition as fr
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s",
-                    datefmt="%H:%M:%S")
-log = logging.getLogger("SecurityHub")
+    format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("SecretEye")
 
 # ─── Flask ────────────────────────────────────────────────────────────────────
-app             = Flask(__name__)
-app.secret_key  = "secreteye-datix-ai-2026"   # for session cookies
+app            = Flask(__name__)
+app.secret_key = "secreteye-hub-2026"
 CORS(app)
-_alert_pool     = ThreadPoolExecutor(max_workers=8, thread_name_prefix="fb-write")
+_pool          = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ai-worker")
 
-# ─── Firebase REST API key (for web login) ────────────────────────────────────
-# Get from Firebase Console → Project Settings → General → Web API Key
-FIREBASE_API_KEY = os.environ.get(
-    "FIREBASE_API_KEY",
-    os.environ.get("EXPO_PUBLIC_FIREBASE_API_KEY", "")
-)
-# Try to load from .env.local if not set
+# ─── Firebase API Key (for web login) ─────────────────────────────────────────
+FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY",
+    os.environ.get("EXPO_PUBLIC_FIREBASE_API_KEY", ""))
+
 if not FIREBASE_API_KEY:
     env_path = os.path.join(os.path.dirname(__file__), "..", ".env.local")
     if os.path.exists(env_path):
         with open(env_path) as f:
             for line in f:
                 if "EXPO_PUBLIC_FIREBASE_API_KEY" in line:
-                    FIREBASE_API_KEY = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    FIREBASE_API_KEY = line.split("=",1)[1].strip().strip('"\'')
                     break
 
 if not FIREBASE_API_KEY:
-    log.warning("⚠️  FIREBASE_API_KEY not found — web login will not work.")
-    log.warning("    Set it in backend/.env or as environment variable.")
+    log.warning("⚠️  FIREBASE_API_KEY not found — web login disabled.")
 
 # ─── Firebase Admin ───────────────────────────────────────────────────────────
 KEY_PATH = "serviceAccountKey.json"
@@ -85,65 +81,103 @@ log.info("✅ Firebase connected.")
 
 # ─── AI Models ────────────────────────────────────────────────────────────────
 log.info("⌛ Loading AI models…")
-WEAPON_MODEL_PATH = "model/weapon.pt"
-FIGHT_MODEL_PATH  = "model/fight.pt"
-FACENET512_LOCAL  = os.path.join("model", "facenet512_weights.h5")
+
+WEAPON_MODEL_PATH  = "model/weapon.pt"
+WEAPON1_MODEL_PATH = "model/weapon1.pt"
+FIGHT_MODEL_PATH   = "model/fight.pt"
 
 for p in (WEAPON_MODEL_PATH, FIGHT_MODEL_PATH):
     if not os.path.exists(p):
         raise FileNotFoundError(f"Model not found: '{p}'")
 
-weapon_model = YOLO(WEAPON_MODEL_PATH)
-fight_model  = YOLO(FIGHT_MODEL_PATH)
-
-if os.path.exists(FACENET512_LOCAL):
-    os.environ["DEEPFACE_HOME"] = os.path.abspath(".")
-    df_dir = os.path.join(".", ".deepface", "weights")
-    os.makedirs(df_dir, exist_ok=True)
-    df_dst = os.path.join(df_dir, "facenet512_weights.h5")
-    if not os.path.exists(df_dst):
-        shutil.copy2(FACENET512_LOCAL, df_dst)
-    DeepFace.build_model("Facenet512")
-    log.info("✅ DeepFace Facenet512 — offline mode.")
-else:
-    DeepFace.build_model("Facenet512")
-    log.info("✅ DeepFace Facenet512 ready.")
+weapon_model  = YOLO(WEAPON_MODEL_PATH)
+fight_model   = YOLO(FIGHT_MODEL_PATH)
+weapon1_model = YOLO(WEAPON1_MODEL_PATH) if os.path.exists(WEAPON1_MODEL_PATH) else weapon_model
 
 VIOLENCE_CLASS_ID = next(
-    (k for k, v in fight_model.names.items() if v.lower() == "violence"), None)
-log.info(f"✅ Models ready. Violence class: {VIOLENCE_CLASS_ID}")
+    (k for k,v in fight_model.names.items() if "violence" in v.lower()), 1)
+
+log.info(f"✅ weapon.pt  — {weapon_model.names}")
+log.info(f"✅ weapon1.pt — {weapon1_model.names}")
+log.info(f"✅ fight.pt   — {fight_model.names} | violence class: {VIOLENCE_CLASS_ID}")
+
+# ─── Face Database ────────────────────────────────────────────────────────────
+FACES_DIR       = "faces"
+FACE_TOLERANCE  = 0.50
+FACE_SKIP       = 3
+
+def load_face_db():
+    known_enc, known_names = [], []
+    if not os.path.exists(FACES_DIR):
+        os.makedirs(FACES_DIR)
+        return known_enc, known_names
+    for ext in ("*.jpg","*.jpeg","*.png","*.JPG","*.PNG"):
+        for path in glob.glob(os.path.join(FACES_DIR, ext)):
+            name  = os.path.splitext(os.path.basename(path))[0].capitalize()
+            image = fr.load_image_file(path)
+            encs  = fr.face_encodings(image)
+            if encs:
+                known_enc.append(encs[0])
+                known_names.append(name)
+                log.info(f"  👤 Face loaded: {name}")
+    return known_enc, known_names
+
+known_encodings, known_names = load_face_db()
+log.info(f"✅ Face DB: {known_names}")
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-WEAPON_CONF           = 0.70
-VIOLENCE_CONF         = 0.65
-CONFIRM_FRAMES_NEEDED = 3
-CONFIRM_EXIT_FRAMES   = 5
-FACE_CONFIRM_NEEDED   = 2
-FACE_THRESH           = 0.38
-TRACK_HOLD_SEC        = 3.0
-ALERT_COOLDOWN_SEC    = 60
-DETECT_EVERY_N        = 4
-FACE_EVERY_N          = 40
-YOLO_INPUT_WIDTH      = 640
-STREAM_FPS_CAP        = 0.1
-STREAM_QUALITY        = 65
+ALERT_COOLDOWN_SEC = 60
+UPLOAD_DIR         = "uploads_tmp"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ─── Runtime State ────────────────────────────────────────────────────────────
-latest_frames:     dict = {}
-raw_frames:        dict = {}
-worker_threads:    dict = {}
-stop_flags:        dict = {}
-recent_detections: dict = {}   # per user_id
-recent_lock = threading.Lock()
+# ─── Job tracking (for video processing) ─────────────────────────────────────
+jobs = {}
 
+# ─── Webcam state ─────────────────────────────────────────────────────────────
+webcam_state = {
+    "running":  False,
+    "thread":   None,
+    "stop":     threading.Event(),
+    "user_id":  None,
+    "latest":   None,   # latest annotated JPEG bytes
+    "cooldown": {},
+}
 
-# ─── Auth Helper ──────────────────────────────────────────────────────────────
+# ─── Firebase helpers ─────────────────────────────────────────────────────────
 
-def firebase_sign_in(email: str, password: str):
-    """Authenticate with Firebase using email/password via REST API.
-    Returns user dict with uid, email, displayName or None on failure."""
+def frame_to_b64(frame, w=480, h=320, quality=60):
+    small = cv2.resize(frame, (w, h))
+    _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return "data:image/jpeg;base64," + base64.b64encode(buf).decode()
+
+def save_detection(user_id, source_name, det_type, frame, cooldown):
+    """Write a detection + evidence frame to Firestore."""
+    key = f"{user_id}_{source_name}_{det_type}"
+    now = time.time()
+    if now - cooldown.get(key, 0) < ALERT_COOLDOWN_SEC:
+        return
+    cooldown[key] = now
+    fc = frame.copy()
+    def _write():
+        try:
+            db_client.collection("detections").add({
+                "userId":     user_id,
+                "deviceName": source_name,
+                "type":       det_type,
+                "imageUrl":   frame_to_b64(fc),
+                "priority":   "High" if det_type in ("Weapon","Violence") else "Medium",
+                "timestamp":  firestore.SERVER_TIMESTAMP,
+                "status":     "new",
+            })
+            log.info(f"🚨 [{source_name}] {det_type} → Firestore (user={user_id})")
+        except Exception as e:
+            log.error(f"Firestore write: {e}")
+    _pool.submit(_write)
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+
+def firebase_sign_in(email, password):
     if not FIREBASE_API_KEY:
-        log.error("FIREBASE_API_KEY not set — cannot authenticate.")
         return None
     try:
         resp = requests.post(
@@ -153,22 +187,16 @@ def firebase_sign_in(email: str, password: str):
             timeout=10,
         )
         if resp.status_code == 200:
-            data = resp.json()
-            return {
-                "uid":         data["localId"],
-                "email":       data["email"],
-                "displayName": data.get("displayName", email.split("@")[0]),
-            }
-        err = resp.json().get("error", {}).get("message", "Unknown error")
-        log.warning(f"Firebase login failed: {err}")
+            d = resp.json()
+            return {"uid": d["localId"], "email": d["email"],
+                    "name": d.get("displayName", email.split("@")[0])}
+        log.warning(f"Login failed: {resp.json().get('error',{}).get('message','')}")
         return None
     except Exception as e:
         log.error(f"firebase_sign_in: {e}")
         return None
 
-
 def login_required(f):
-    """Decorator — redirects to login if not authenticated."""
     @wraps(f)
     def decorated(*args, **kwargs):
         if "user" not in session:
@@ -176,401 +204,252 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+# ─── AI Processing Helpers ────────────────────────────────────────────────────
 
-# ─── Per-User Device Startup ──────────────────────────────────────────────────
+def run_yolo_on_frame(frame, model, conf, class_filter=None):
+    """Run YOLO on a frame. Returns (detections_list, annotated_frame)."""
+    results = model.predict(frame, conf=conf, verbose=False, iou=0.45,
+                            classes=[class_filter] if class_filter is not None else None)
+    display = frame.copy()
+    dets    = []
+    if results and len(results[0].boxes) > 0:
+        for box in results[0].boxes:
+            cls  = int(box.cls[0])
+            name = model.names[cls]
+            c    = float(box.conf[0])
+            x1,y1,x2,y2 = [int(v) for v in box.xyxy[0]]
+            color = (0,0,220) if "gun" in name.lower() or "weapon" in name.lower() \
+                    else (0,100,255)
+            cv2.rectangle(display,(x1,y1),(x2,y2),color,2)
+            cv2.putText(display,f"{name} {c:.0%}",(x1,max(y1-8,20)),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+            dets.append({"class": name, "conf": round(c,3)})
+    return dets, display
 
-def start_user_devices(user_id: str):
-    """Start camera workers for all active devices belonging to user_id only."""
-    log.info(f"🔍 Starting devices for user {user_id}…")
-    try:
-        docs = (db_client.collection("devices")
-                .where("userId", "==", user_id)
-                .where("status", "==", "Active")
-                .get())
-        count = 0
-        for doc in docs:
-            d    = doc.to_dict()
-            name = d.get("name", "").strip()
-            ip   = d.get("ip",   "").strip()
-            if name and ip:
-                ensure_worker_running(user_id, name, ip)
-                count += 1
-        log.info(f"✅ Started {count} device(s) for user {user_id}")
-    except Exception as e:
-        log.error(f"start_user_devices: {e}")
+def run_face_on_frame(frame):
+    """Run face recognition on a frame. Returns list of (name, box, color)."""
+    small = cv2.resize(frame,(0,0),fx=0.5,fy=0.5)
+    rgb   = cv2.cvtColor(small,cv2.COLOR_BGR2RGB)
+    locs  = fr.face_locations(rgb, model="hog")
+    encs  = fr.face_encodings(rgb, locs)
+    results = []
+    for (top,right,bottom,left), enc in zip(locs, encs):
+        top*=2; right*=2; bottom*=2; left*=2
+        name  = "Stranger"
+        color = (0,0,255)
+        if known_encodings:
+            distances = fr.face_distance(known_encodings, enc)
+            best      = int(np.argmin(distances))
+            if distances[best] < FACE_TOLERANCE:
+                name  = known_names[best]
+                color = (0,220,0)
+        results.append((name, (top,right,bottom,left), color))
+    return results
 
+def annotate_faces(frame, face_results):
+    display = frame.copy()
+    for name,(top,right,bottom,left),color in face_results:
+        cv2.rectangle(display,(left,top),(right,bottom),color,2)
+        cv2.rectangle(display,(left,bottom),(right,bottom+32),color,-1)
+        cv2.putText(display,name,(left+6,bottom+22),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.75,(255,255,255),2)
+    return display
 
-def stop_user_devices(user_id: str):
-    """Stop all camera workers belonging to user_id."""
-    prefix = f"{user_id}_"
-    for key in list(worker_threads.keys()):
-        if key.startswith(prefix):
-            if key in stop_flags:
-                stop_flags[key].set()
-    log.info(f"■ Stopped all workers for user {user_id}")
+# ─── Video Processing (background job) ───────────────────────────────────────
 
+def process_video_job(job_id, input_path, output_path,
+                      model_id, conf, user_id, source_name):
+    jobs[job_id].update({"status":"running","message":"Starting AI analysis..."})
+    cooldown = {}
 
-# ─── Firebase Helpers ─────────────────────────────────────────────────────────
+    cap   = cv2.VideoCapture(input_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps   = int(cap.get(cv2.CAP_PROP_FPS)) or 25
 
-def get_homeowner_ref(user_id):
-    try:
-        doc = db_client.collection("users").document(user_id).get()
-        if not doc.exists: return None, None
-        face_data = doc.to_dict().get("faceReference")
-        if not face_data: return None, None
-        if "base64," in face_data:
-            face_data = face_data.split("base64,")[1]
-        nparr   = np.frombuffer(base64.b64decode(face_data), np.uint8)
-        img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img_bgr is None: return None, None
-        tmp = os.path.join(tempfile.gettempdir(), f"ref_{user_id}.jpg")
-        cv2.imwrite(tmp, img_bgr)
-        return img_bgr, tmp
-    except Exception as e:
-        log.error(f"get_homeowner_ref: {e}")
-        return None, None
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
+    model_map = {
+        "weapon":   (weapon_model,  None,              "Gun"),
+        "weapon1":  (weapon1_model, None,              "Weapon"),
+        "violence": (fight_model,   VIOLENCE_CLASS_ID, "Violence"),
+    }
 
-def frame_to_b64(frame, quality=55):
-    small = cv2.resize(frame, (480, 320))
-    _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    return "data:image/jpeg;base64," + base64.b64encode(buf).decode()
+    frame_count = 0
+    face_cache  = []
+    start       = time.time()
 
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+        frame_count += 1
 
-def save_alert(user_id, device_name, alert_type, frame, cooldown_map):
-    key = f"{user_id}_{device_name}_{alert_type}"
-    now = time.time()
-    if now - cooldown_map.get(key, 0) < ALERT_COOLDOWN_SEC: return
-    cooldown_map[key] = now
-    fc = frame.copy()
-    with recent_lock:
-        if user_id not in recent_detections:
-            recent_detections[user_id] = []
-        recent_detections[user_id].insert(0, {
-            "type":      alert_type,
-            "device":    device_name,
-            "time":      time.strftime("%H:%M:%S"),
-            "image_b64": frame_to_b64(fc),
+        display = frame.copy()
+
+        if model_id == "face":
+            if frame_count % FACE_SKIP == 0:
+                face_cache = run_face_on_frame(frame)
+            display = annotate_faces(frame, face_cache)
+            for name,_,_ in face_cache:
+                if name == "Stranger":
+                    save_detection(user_id, source_name, "Stranger", frame, cooldown)
+        elif model_id == "all":
+            # Weapon
+            dets_w, disp_w = run_yolo_on_frame(frame, weapon_model, conf)
+            if dets_w:
+                save_detection(user_id, source_name, "Weapon", frame, cooldown)
+                display = disp_w
+            # Violence
+            dets_v, disp_v = run_yolo_on_frame(frame, fight_model, conf, VIOLENCE_CLASS_ID)
+            if dets_v:
+                save_detection(user_id, source_name, "Violence", frame, cooldown)
+                display = disp_v
+            # Face
+            if frame_count % FACE_SKIP == 0:
+                face_cache = run_face_on_frame(frame)
+            display = annotate_faces(display, face_cache)
+            for name,_,_ in face_cache:
+                if name == "Stranger":
+                    save_detection(user_id, source_name, "Stranger", frame, cooldown)
+        else:
+            m, cf, label = model_map[model_id]
+            dets, display = run_yolo_on_frame(frame, m, conf, cf)
+            if dets:
+                save_detection(user_id, source_name, label, frame, cooldown)
+
+        writer.write(display)
+        pct = int(frame_count / total * 100)
+        jobs[job_id].update({
+            "progress": pct,
+            "message":  f"Processing frame {frame_count}/{total}",
         })
-        if len(recent_detections[user_id]) > 20:
-            recent_detections[user_id].pop()
-
-    def _write():
-        try:
-            db_client.collection("detections").add({
-                "userId":     user_id,
-                "deviceName": device_name,
-                "type":       alert_type,
-                "imageUrl":   frame_to_b64(fc),
-                "priority":   "High" if alert_type in ("Weapon","Violence") else "Medium",
-                "timestamp":  firestore.SERVER_TIMESTAMP,
-                "status":     "new",
-            })
-            log.info(f"🚨 [{device_name}] {alert_type} → Firestore")
-        except Exception as e:
-            log.error(f"Firebase write: {e}")
-    _alert_pool.submit(_write)
-
-
-# ─── Confirmation Gate ────────────────────────────────────────────────────────
-
-class ConfirmationGate:
-    def __init__(self, needed=CONFIRM_FRAMES_NEEDED, exit_frames=CONFIRM_EXIT_FRAMES):
-        self._needed=needed; self._exit=exit_frames
-        self._hit:dict={}; self._miss:dict={}; self._conf:set=set()
-
-    def update(self, labels):
-        nc=[]; s=set(labels)
-        for l in s:
-            self._hit[l]=self._hit.get(l,0)+1; self._miss[l]=0
-            if self._hit[l]>=self._needed and l not in self._conf:
-                self._conf.add(l); nc.append(l)
-        for l in list(self._hit):
-            if l not in s:
-                self._hit[l]=0
-                if l in self._conf:
-                    self._miss[l]=self._miss.get(l,0)+1
-                    if self._miss[l]>=self._exit:
-                        self._conf.discard(l); self._miss[l]=0
-                else: self._miss[l]=0
-        return nc
-
-    def is_confirmed(self,l): return l in self._conf
-    def active(self): return list(self._conf)
-
-
-# ─── Tracked Box ─────────────────────────────────────────────────────────────
-
-class TrackedBox:
-    def __init__(self, box_xyxy, label, color):
-        x1,y1,x2,y2=[int(v) for v in box_xyxy]
-        self.label=label; self.color=color
-        self.last_seen=time.time(); self._box=(x1,y1,x2-x1,y2-y1)
-
-    def refresh(self, box_xyxy):
-        x1,y1,x2,y2=[int(v) for v in box_xyxy]
-        self._box=(x1,y1,x2-x1,y2-y1); self.last_seen=time.time()
-
-    def is_expired(self): return (time.time()-self.last_seen)>TRACK_HOLD_SEC
-
-    def draw(self, frame):
-        if not self._box: return
-        x,y,w,h=self._box
-        cv2.rectangle(frame,(x,y),(x+w,y+h),self.color,2)
-        (tw,th),_=cv2.getTextSize(self.label,cv2.FONT_HERSHEY_SIMPLEX,0.6,2)
-        cv2.rectangle(frame,(x,y-th-10),(x+tw+8,y),self.color,-1)
-        cv2.putText(frame,self.label,(x+4,y-5),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
-
-
-# ─── FaceID Worker ────────────────────────────────────────────────────────────
-
-class FaceIDWorker:
-    def __init__(self, ref_path, threshold=FACE_THRESH):
-        self.ref_path=ref_path; self.threshold=threshold
-        self._in_q=queue.Queue(maxsize=1); self._out_q=queue.Queue(maxsize=1)
-        self._cascade=cv2.CascadeClassifier(
-            cv2.data.haarcascades+"haarcascade_frontalface_default.xml")
-        threading.Thread(target=self._run,daemon=True,name="face-id").start()
-
-    def submit(self,frame):
-        try: self._in_q.put_nowait(frame)
-        except queue.Full: pass
-
-    def get_result(self):
-        try: return self._out_q.get_nowait()
-        except queue.Empty: return None
-
-    def stop(self):
-        try: self._in_q.put_nowait(None)
-        except queue.Full: pass
-
-    def _push(self,label,dist,box):
-        try: self._out_q.get_nowait()
-        except queue.Empty: pass
-        self._out_q.put((label,dist,box))
-
-    def _run(self):
-        faces=[]
-        while True:
-            frame=self._in_q.get()
-            if frame is None: break
-            try:
-                gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
-                faces=self._cascade.detectMultiScale(gray,1.1,6,minSize=(60,60))
-                if len(faces)==0: self._push("No Face",1.0,None); continue
-                box=tuple(faces[0])
-                res=DeepFace.verify(
-                    img1_path=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB),
-                    img2_path=self.ref_path,model_name="Facenet512",
-                    detector_backend="opencv",enforce_detection=True,
-                    distance_metric="cosine",silent=True)
-                dist=res["distance"]
-                self._push("Homeowner" if dist<self.threshold else "Stranger",dist,box)
-            except Exception as e:
-                log.debug(f"FaceID: {e}")
-                self._push("Stranger",1.0,tuple(faces[0]) if len(faces)>0 else None)
-
-
-# ─── Drawing Helpers ──────────────────────────────────────────────────────────
-
-def draw_face_box(frame,box,label,dist):
-    if not box: return frame
-    x,y,w,h=box; color=(0,200,0) if label=="Homeowner" else (0,0,220)
-    tag=f"{label} ({dist:.2f})"
-    cv2.rectangle(frame,(x,y),(x+w,y+h),color,2)
-    (tw,th),_=cv2.getTextSize(tag,cv2.FONT_HERSHEY_SIMPLEX,0.55,2)
-    cv2.rectangle(frame,(x,y-th-10),(x+tw+6,y),color,-1)
-    cv2.putText(frame,tag,(x+3,y-5),cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),2)
-    return frame
-
-def draw_hud(frame,face_label,threats):
-    h,w=frame.shape[:2]
-    danger=bool(threats) or face_label=="Stranger"
-    color=(0,0,220) if danger else (0,200,0)
-    ts=", ".join(threats) if threats else "Clear"
-    cv2.rectangle(frame,(0,0),(w,46),(0,0,0),-1)
-    cv2.putText(frame,f"Face: {face_label}  |  {ts}",
-                (10,32),cv2.FONT_HERSHEY_SIMPLEX,0.70,color,2)
-    return frame
-
-def resize_for_yolo(frame):
-    h,w=frame.shape[:2]
-    if w==YOLO_INPUT_WIDTH: return frame
-    s=YOLO_INPUT_WIDTH/w
-    return cv2.resize(frame,(YOLO_INPUT_WIDTH,int(h*s)),interpolation=cv2.INTER_LINEAR)
-
-def refresh_tracker(tbs,box_xyxy,label,color):
-    for tb in tbs:
-        if tb.label==label: tb.refresh(box_xyxy); return
-    tbs.append(TrackedBox(box_xyxy,label,color))
-
-
-# ─── Camera Worker ────────────────────────────────────────────────────────────
-
-def camera_worker(user_id, device_name, stream_ip, stop_event):
-    key=f"{user_id}_{device_name}"; cooldown={}
-    stream_url=(stream_ip if stream_ip.startswith(("http://","https://","rtsp://"))
-                else f"http://{stream_ip}/video")
-    log.info(f"▶ [{device_name}] {stream_url}")
-
-    _,ref_path=get_homeowner_ref(user_id)
-    face_worker=FaceIDWorker(ref_path) if ref_path else None
-    if not face_worker: log.warning(f"[{device_name}] Face ID disabled.")
-
-    face_label="Scanning…"; face_dist=1.0; face_box=None
-    face_stranger_count=0; frame_count=0
-    gate=ConfirmationGate(); tbs=[]
-
-    cap=cv2.VideoCapture(stream_url)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
-    reconnect_delay=2
-
-    while not stop_event.is_set():
-        ret,frame=cap.read()
-        if not ret:
-            log.warning(f"[{device_name}] Stream lost — retry {reconnect_delay}s")
-            cap.release(); time.sleep(reconnect_delay)
-            reconnect_delay=min(reconnect_delay*2,30)
-            cap=cv2.VideoCapture(stream_url)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE,1); continue
-
-        reconnect_delay=2; frame_count+=1
-        raw_frames[key]=frame.copy()
-        display=frame.copy()
-
-        run_det =(frame_count%DETECT_EVERY_N==0)
-        run_face=face_worker is not None and (frame_count%FACE_EVERY_N==0)
-
-        if face_worker:
-            res=face_worker.get_result()
-            if res:
-                nl,nd,nb=res; face_label=nl; face_dist=nd
-                face_box=nb if nl!="No Face" else None
-                if face_label=="Stranger":
-                    face_stranger_count+=1
-                    if face_stranger_count>=FACE_CONFIRM_NEEDED:
-                        save_alert(user_id,device_name,"Stranger",display,cooldown)
-                        face_stranger_count=0
-                else: face_stranger_count=0
-
-        if run_det:
-            yf=resize_for_yolo(frame); rd=[]; w_res=None; v_boxes=[]
-            try:
-                w_res=weapon_model.predict(yf,conf=WEAPON_CONF,verbose=False,iou=0.45)
-                if w_res and len(w_res[0].boxes)>0: rd.append("Weapon")
-            except Exception as e: log.error(f"[{device_name}] Weapon: {e}")
-            try:
-                f_res=fight_model.predict(yf,conf=VIOLENCE_CONF,verbose=False,iou=0.45,
-                    classes=[VIOLENCE_CLASS_ID] if VIOLENCE_CLASS_ID is not None else None)
-                v_boxes=[b for b in f_res[0].boxes if VIOLENCE_CLASS_ID is not None
-                         and int(b.cls[0])==VIOLENCE_CLASS_ID]
-                if v_boxes: rd.append("Violence")
-            except Exception as e: log.error(f"[{device_name}] Violence: {e}")
-            for label in gate.update(rd):
-                save_alert(user_id,device_name,label,display,cooldown)
-            if gate.is_confirmed("Weapon") and w_res and len(w_res[0].boxes)>0:
-                for b in w_res[0].boxes:
-                    refresh_tracker(tbs,b.xyxy[0],"Weapon",(0,0,220))
-            if gate.is_confirmed("Violence") and v_boxes:
-                for b in v_boxes:
-                    refresh_tracker(tbs,b.xyxy[0],"Violence",(0,100,255))
-
-        if run_face: face_worker.submit(frame.copy())
-
-        active=[]; alive=[]
-        for tb in tbs:
-            if tb.is_expired(): continue
-            if gate.is_confirmed(tb.label): tb.draw(display); active.append(tb.label)
-            alive.append(tb)
-        tbs=alive
-        if face_box and face_label not in ("No Face","Scanning…"):
-            display=draw_face_box(display,face_box,face_label,face_dist)
-        display=draw_hud(display,face_label,list(dict.fromkeys(active)))
-        latest_frames[key]=display
 
     cap.release()
-    if face_worker: face_worker.stop()
-    latest_frames.pop(key,None); raw_frames.pop(key,None)
-    log.info(f"■ [{device_name}] Stopped.")
+    writer.release()
 
+    try: os.remove(input_path)
+    except: pass
 
-# ─── Worker Lifecycle ─────────────────────────────────────────────────────────
+    jobs[job_id].update({
+        "status":      "done",
+        "progress":    100,
+        "message":     "Complete!",
+        "frames":      frame_count,
+        "elapsed":     round(time.time()-start, 1),
+        "output_path": output_path,
+        "filename":    os.path.basename(output_path),
+    })
+    log.info(f"✅ Job {job_id} done — {frame_count} frames in {jobs[job_id]['elapsed']}s")
 
-def ensure_worker_running(user_id, device_name, ip=None):
-    key=f"{user_id}_{device_name}"
-    if key in worker_threads and worker_threads[key].is_alive(): return True
-    if not ip:
-        try:
-            docs=(db_client.collection("devices")
-                  .where("userId","==",user_id)
-                  .where("name","==",device_name).limit(1).get())
-        except Exception as e:
-            log.error(f"Firestore lookup: {e}"); return False
-        if not docs: return False
-        data=docs[0].to_dict()
-        if data.get("status","").lower()!="active": return False
-        ip=data.get("ip","").strip()
-    if not ip: return False
-    stop_event=threading.Event(); stop_flags[key]=stop_event
-    t=threading.Thread(target=camera_worker,
-                       args=(user_id,device_name,ip,stop_event),
-                       daemon=True,name=f"cam-{key}")
-    t.start(); worker_threads[key]=t
-    return True
+# ─── Webcam worker ────────────────────────────────────────────────────────────
 
+def webcam_worker(user_id, stop_event):
+    log.info(f"📷 Webcam started for user {user_id}")
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        webcam_state["running"] = False
+        log.error("❌ Cannot open webcam")
+        return
 
-def stop_worker(user_id, device_name):
-    key=f"{user_id}_{device_name}"
-    if key in stop_flags: stop_flags[key].set()
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+    cooldown    = {}
+    frame_count = 0
+    face_cache  = []
 
-# ─── HTML Templates ───────────────────────────────────────────────────────────
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.1)
+            continue
+
+        frame_count += 1
+        display = frame.copy()
+
+        # Face recognition every FACE_SKIP frames
+        if frame_count % FACE_SKIP == 0:
+            face_cache = run_face_on_frame(frame)
+            for name,_,_ in face_cache:
+                if name == "Stranger":
+                    save_detection(user_id, "Webcam", "Stranger", frame, cooldown)
+
+        display = annotate_faces(display, face_cache)
+
+        # Weapon detection every 4 frames
+        if frame_count % 4 == 0:
+            try:
+                dets_w, disp_w = run_yolo_on_frame(frame, weapon_model, 0.45)
+                if dets_w:
+                    save_detection(user_id, "Webcam", "Weapon", frame, cooldown)
+                    display = annotate_faces(disp_w, face_cache)
+            except: pass
+
+            try:
+                dets_v, disp_v = run_yolo_on_frame(frame, fight_model, 0.40, VIOLENCE_CLASS_ID)
+                if dets_v:
+                    save_detection(user_id, "Webcam", "Violence", frame, cooldown)
+                    display = annotate_faces(disp_v, face_cache)
+            except: pass
+
+        # Encode latest frame as JPEG for streaming
+        _, buf = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        webcam_state["latest"] = buf.tobytes()
+
+        time.sleep(0.05)  # ~20fps
+
+    cap.release()
+    webcam_state["running"] = False
+    webcam_state["latest"]  = None
+    log.info("📷 Webcam stopped")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML Templates
+# ─────────────────────────────────────────────────────────────────────────────
 
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>SecretEye — Login</title>
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{background:#0f172a;display:flex;align-items:center;
-         justify-content:center;min-height:100vh;
-         font-family:'Segoe UI',sans-serif}
-    .card{background:#1e293b;border-radius:24px;padding:48px 40px;
-          width:100%;max-width:420px;border:1px solid #334155;
-          box-shadow:0 24px 64px rgba(0,0,0,0.5)}
-    .logo{text-align:center;margin-bottom:32px}
-    .logo h1{font-size:28px;font-weight:800;color:#0891b2;letter-spacing:1px}
-    .logo p{color:#64748b;font-size:14px;margin-top:6px}
-    .field{margin-bottom:20px}
-    label{display:block;font-size:12px;font-weight:700;color:#64748b;
-          text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
-    input{width:100%;background:#0f172a;border:1px solid #334155;
-          border-radius:12px;padding:14px 16px;color:#e2e8f0;
-          font-size:14px;outline:none;transition:border-color .2s}
-    input:focus{border-color:#0891b2}
-    .btn{width:100%;background:#0891b2;color:#fff;border:none;
-         border-radius:12px;padding:16px;font-size:15px;font-weight:700;
-         cursor:pointer;margin-top:8px;letter-spacing:1px;
-         transition:background .2s}
-    .btn:hover{background:#0e7490}
-    .error{background:#7f1d1d;color:#fca5a5;padding:12px 16px;
-           border-radius:10px;font-size:13px;margin-bottom:20px;
-           border:1px solid #991b1b}
-    .footer{text-align:center;margin-top:24px;color:#475569;font-size:12px}
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SecretEye — Sign In</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#f1f5f9;display:flex;align-items:center;justify-content:center;
+     min-height:100vh;font-family:'Inter',sans-serif}
+.card{background:#fff;border-radius:24px;padding:48px 40px;width:100%;max-width:420px;
+      box-shadow:0 4px 24px rgba(0,0,0,.08);border:1px solid #e2e8f0}
+.logo{text-align:center;margin-bottom:36px}
+.logo-icon{font-size:40px;margin-bottom:12px}
+.logo h1{font-family:'Space Grotesk',sans-serif;font-size:26px;font-weight:800;color:#0f172a}
+.logo p{color:#64748b;font-size:14px;margin-top:6px}
+.field{margin-bottom:18px}
+label{display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:6px;
+      text-transform:uppercase;letter-spacing:.5px}
+input{width:100%;background:#f8fafc;border:1.5px solid #e2e8f0;border-radius:12px;
+      padding:13px 16px;color:#0f172a;font-size:14px;outline:none;transition:.2s;
+      font-family:'Inter',sans-serif}
+input:focus{border-color:#2563eb;background:#fff}
+.btn{width:100%;background:#2563eb;color:#fff;border:none;border-radius:12px;
+     padding:15px;font-size:15px;font-weight:700;cursor:pointer;margin-top:8px;
+     font-family:'Inter',sans-serif;transition:.2s;letter-spacing:.3px}
+.btn:hover{background:#1d4ed8}
+.error{background:#fef2f2;color:#dc2626;padding:12px 16px;border-radius:10px;
+       font-size:13px;margin-bottom:18px;border:1px solid #fecaca}
+.footer{text-align:center;margin-top:24px;color:#94a3b8;font-size:12px}
+</style>
 </head>
 <body>
 <div class="card">
   <div class="logo">
-    <h1>🔐 SecretEye</h1>
-    <p>AI Security Monitor</p>
+    <div class="logo-icon">🔐</div>
+    <h1>SecretEye</h1>
+    <p>AI Security Platform</p>
   </div>
-  {% if error %}
-  <div class="error">{{ error }}</div>
-  {% endif %}
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
   <form method="POST">
     <div class="field">
       <label>Email Address</label>
@@ -579,349 +458,646 @@ LOGIN_HTML = """<!DOCTYPE html>
     </div>
     <div class="field">
       <label>Password</label>
-      <input type="password" name="password" placeholder="••••••••" required>
+      <input type="password" name="password" placeholder="Enter your password" required>
     </div>
-    <button type="submit" class="btn">SIGN IN →</button>
+    <button type="submit" class="btn">Sign In →</button>
   </form>
-  <div class="footer">Use the same credentials as the SecretEye mobile app</div>
+  <div class="footer">Use your SecretEye mobile app credentials</div>
 </div>
 </body>
 </html>"""
 
-
-MONITOR_HTML = """<!DOCTYPE html>
+MAIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>SecretEye Monitor</title>
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{background:#0f172a;color:#e2e8f0;font-family:'Segoe UI',sans-serif}
-    .nav{background:#1e293b;padding:14px 24px;display:flex;align-items:center;
-         justify-content:space-between;border-bottom:2px solid #0891b2}
-    .nav h1{font-size:18px;font-weight:800;color:#0891b2;letter-spacing:1px}
-    .nav-right{display:flex;align-items:center;gap:16px}
-    .user-tag{font-size:12px;color:#94a3b8}
-    .status{font-size:12px;color:#94a3b8;display:flex;align-items:center;gap:6px}
-    .dot{width:8px;height:8px;border-radius:50%;background:#22c55e;
-         animation:pulse 2s infinite}
-    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-    .logout{font-size:12px;color:#ef4444;text-decoration:none;font-weight:600;
-            padding:6px 12px;border:1px solid #7f1d1d;border-radius:8px}
-    .logout:hover{background:#7f1d1d}
-    .layout{display:grid;grid-template-columns:1fr 320px;height:calc(100vh - 58px)}
-    .streams{padding:20px;overflow-y:auto}
-    .streams h2{font-size:11px;font-weight:700;color:#64748b;
-                text-transform:uppercase;letter-spacing:2px;margin-bottom:14px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:14px}
-    .cam-card{background:#1e293b;border-radius:14px;overflow:hidden;border:1px solid #334155}
-    .cam-card img{width:100%;display:block;min-height:220px;object-fit:cover;background:#0f172a}
-    .cam-label{padding:10px 14px;font-size:12px;color:#94a3b8;font-weight:600;
-               display:flex;align-items:center;gap:6px}
-    .live-dot{width:6px;height:6px;border-radius:50%;background:#ef4444;
-              animation:pulse 1s infinite}
-    .sidebar{background:#1e293b;border-left:1px solid #334155;
-             display:flex;flex-direction:column;overflow:hidden}
-    .sidebar h2{padding:16px 18px;font-size:11px;font-weight:700;color:#64748b;
-                text-transform:uppercase;letter-spacing:2px;border-bottom:1px solid #334155}
-    .alerts{flex:1;overflow-y:auto;padding:12px}
-    .alert-card{background:#0f172a;border-radius:12px;margin-bottom:10px;
-                overflow:hidden;border:1px solid #1e293b}
-    .alert-card img{width:100%;height:90px;object-fit:cover;display:block}
-    .alert-meta{padding:8px 12px}
-    .alert-type{font-size:13px;font-weight:700}
-    .Weapon{color:#ef4444}.Violence{color:#f97316}.Stranger{color:#a855f7}
-    .alert-info{font-size:11px;color:#475569;margin-top:3px}
-    .empty{text-align:center;padding:40px 16px;color:#475569;font-size:13px;line-height:1.8}
-    ::-webkit-scrollbar{width:5px}
-    ::-webkit-scrollbar-track{background:#0f172a}
-    ::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SecretEye — AI Hub</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#f8fafc;color:#0f172a;font-family:'Inter',sans-serif;min-height:100vh}
+
+/* Nav */
+nav{background:#fff;border-bottom:1px solid #e2e8f0;padding:0 28px;height:58px;
+    display:flex;align-items:center;justify-content:space-between;
+    position:sticky;top:0;z-index:100;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.nav-brand{font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:800}
+.nav-brand span{color:#2563eb}
+.nav-right{display:flex;align-items:center;gap:12px}
+.nav-user{font-size:13px;color:#64748b;font-weight:500}
+.nav-logout{font-size:13px;color:#ef4444;text-decoration:none;font-weight:600;
+            padding:6px 14px;border:1.5px solid #fecaca;border-radius:8px;
+            transition:.2s}
+.nav-logout:hover{background:#fef2f2}
+
+/* Tabs */
+.tabs{display:flex;gap:4px;background:#f1f5f9;border-radius:12px;padding:4px;
+      margin-bottom:28px}
+.tab{flex:1;padding:10px;border:none;background:none;border-radius:9px;
+     font-size:14px;font-weight:600;cursor:pointer;transition:.2s;
+     font-family:'Inter',sans-serif;color:#64748b}
+.tab.active{background:#fff;color:#0f172a;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+
+/* Layout */
+.container{max-width:960px;margin:0 auto;padding:32px 24px 60px}
+.page-title{font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;margin-bottom:4px}
+.page-sub{color:#64748b;font-size:14px;margin-bottom:28px}
+
+/* Cards */
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:18px;padding:28px;
+      margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+.card-label{font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
+            color:#94a3b8;margin-bottom:16px}
+
+/* Upload zone */
+.upload-zone{border:2px dashed #cbd5e1;border-radius:14px;padding:44px 24px;
+             text-align:center;cursor:pointer;transition:.2s;position:relative;
+             overflow:hidden;background:#f8fafc}
+.upload-zone:hover,.upload-zone.drag{border-color:#2563eb;background:#eff6ff}
+.upload-zone input{position:absolute;inset:0;opacity:0;cursor:pointer;z-index:2}
+.upload-icon{font-size:36px;margin-bottom:10px}
+.upload-title{font-weight:700;font-size:15px;margin-bottom:4px}
+.upload-sub{font-size:13px;color:#94a3b8}
+.file-badge{display:none;margin-top:12px;font-size:13px;color:#2563eb;font-weight:600}
+
+/* Model grid */
+.model-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}
+@media(max-width:600px){.model-grid{grid-template-columns:1fr 1fr}}
+.model-opt{border:2px solid #e2e8f0;border-radius:12px;padding:16px;
+           cursor:pointer;transition:.2s;text-align:center}
+.model-opt:hover{border-color:#93c5fd;background:#f0f9ff}
+.model-opt.sel{border-color:#2563eb;background:#eff6ff}
+.model-opt input{display:none}
+.model-opt-icon{font-size:24px;margin-bottom:6px}
+.model-opt-name{font-weight:700;font-size:13px}
+.model-opt-sub{font-size:11px;color:#94a3b8;margin-top:3px}
+
+/* Conf slider */
+.conf-wrap{margin-bottom:20px}
+.conf-wrap label{font-size:12px;font-weight:600;color:#64748b;display:block;margin-bottom:8px}
+.conf-wrap label span{color:#2563eb;font-weight:700}
+input[type=range]{width:100%;accent-color:#2563eb}
+
+/* Buttons */
+.btn-primary{width:100%;padding:15px;border-radius:12px;border:none;
+             background:#2563eb;color:#fff;font-size:15px;font-weight:700;
+             cursor:pointer;transition:.2s;font-family:'Inter',sans-serif}
+.btn-primary:hover{background:#1d4ed8;transform:translateY(-1px);
+                   box-shadow:0 4px 16px rgba(37,99,235,.3)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-green{background:#16a34a}.btn-green:hover{background:#15803d}
+.btn-red{background:#dc2626}.btn-red:hover{background:#b91c1c}
+
+/* Progress */
+.progress-wrap{background:#f1f5f9;border-radius:100px;height:8px;overflow:hidden;margin:14px 0}
+.progress-fill{height:100%;background:linear-gradient(90deg,#2563eb,#7c3aed);
+               border-radius:100px;transition:width .4s}
+.progress-text{font-size:12px;color:#64748b;text-align:center}
+.status-line{font-size:14px;font-weight:600;margin-bottom:8px}
+
+/* Result video */
+.result-video{width:100%;border-radius:12px;background:#0f172a;max-height:460px;border:1px solid #e2e8f0}
+.result-meta{display:flex;gap:20px;flex-wrap:wrap;margin-top:14px}
+.meta-it{font-size:13px}
+.meta-it span:first-child{color:#94a3b8;margin-right:4px}
+.meta-it span:last-child{font-weight:600}
+.dl-btn{display:inline-flex;align-items:center;gap:8px;margin-top:14px;
+        padding:9px 18px;background:#f1f5f9;border:1px solid #e2e8f0;
+        border-radius:10px;font-size:13px;font-weight:600;color:#0f172a;
+        text-decoration:none;transition:.2s}
+.dl-btn:hover{background:#e2e8f0}
+
+/* Webcam */
+.webcam-feed{width:100%;border-radius:14px;background:#0f172a;max-height:460px;
+             display:block;border:1px solid #e2e8f0}
+.webcam-status{display:flex;align-items:center;gap:8px;font-size:13px;margin-top:12px}
+.status-dot{width:8px;height:8px;border-radius:50%;background:#94a3b8}
+.status-dot.live{background:#22c55e;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* Face DB badge */
+.face-db-badge{display:flex;align-items:center;gap:8px;font-size:13px;padding:10px 14px;
+               background:#f0fdf4;border:1px solid #86efac;border-radius:10px;margin-bottom:16px}
+.face-db-badge.empty{background:#fffbeb;border-color:#fcd34d;color:#92400e}
+
+/* Hidden */
+.hidden{display:none!important}
+
+/* Alert feed */
+.alert-feed{max-height:300px;overflow-y:auto}
+.alert-item{display:flex;align-items:center;gap:12px;padding:10px 0;
+            border-bottom:1px solid #f1f5f9}
+.alert-item:last-child{border-bottom:none}
+.alert-icon{font-size:20px;flex-shrink:0}
+.alert-text{flex:1}
+.alert-type{font-weight:700;font-size:13px}
+.alert-meta{font-size:11px;color:#94a3b8;margin-top:2px}
+.alert-type.Weapon{color:#dc2626}
+.alert-type.Violence{color:#ea580c}
+.alert-type.Stranger{color:#9333ea}
+</style>
 </head>
 <body>
-<nav class="nav">
-  <h1> SecretEye Monitor</h1>
+
+<nav>
+  <div class="nav-brand">Secret<span>Eye</span></div>
   <div class="nav-right">
-    <div class="status"><span class="dot"></span>AI Active — Datix AI</div>
-    <span class="user-tag">{{ display_name }}</span>
-    <a href="/logout" class="logout">Sign Out</a>
+    <span class="nav-user">{{ user_name }}</span>
+    <a href="/logout" class="nav-logout">Sign Out</a>
   </div>
 </nav>
-<div class="layout">
-  <div class="streams">
-    <h2>Your Live AI Streams Bounding Boxes + HUD</h2>
-    <div class="grid" id="grid"><div class="empty">Loading cameras…</div></div>
+
+<div class="container">
+  <div class="page-title">AI Security Hub</div>
+  <p class="page-sub">Upload videos for AI analysis or monitor live with your webcam</p>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('video',this)">🎬 Video Analysis</button>
+    <button class="tab" onclick="switchTab('webcam',this)">📷 Live Webcam</button>
+    <button class="tab" onclick="switchTab('alerts',this)">🔔 Recent Alerts</button>
   </div>
-  <div class="sidebar">
-    <h2>Recent Detections</h2>
-    <div class="alerts" id="alerts">
-      <div class="empty">No detections yet.<br>AI is monitoring…</div>
+
+  <!-- ─── VIDEO TAB ─────────────────────────────────────── -->
+  <div id="tab-video">
+
+    <!-- Upload -->
+    <div class="card">
+      <div class="card-label">Upload Video</div>
+      <div class="upload-zone" id="drop-zone">
+        <input type="file" id="file-input" accept="video/*">
+        <div class="upload-icon">🎬</div>
+        <div class="upload-title">Click or drag your video here</div>
+        <div class="upload-sub">MP4 · AVI · MOV supported</div>
+        <div class="file-badge" id="file-badge"></div>
+      </div>
+    </div>
+
+    <!-- Model + Conf -->
+    <div class="card">
+      <div class="card-label">Detection Model</div>
+
+      <div class="face-db-badge" id="face-db-badge">
+        <span id="face-db-txt">👤 Loading face database...</span>
+      </div>
+
+      <div class="model-grid">
+        <label class="model-opt sel">
+          <input type="radio" name="model" value="all" checked>
+          <div class="model-opt-icon">🎯</div>
+          <div class="model-opt-name">All Models</div>
+          <div class="model-opt-sub">Weapon + Violence + Face</div>
+        </label>
+        <label class="model-opt">
+          <input type="radio" name="model" value="violence">
+          <div class="model-opt-icon">⚡</div>
+          <div class="model-opt-name">Violence</div>
+          <div class="model-opt-sub">Fight detection</div>
+        </label>
+        <label class="model-opt">
+          <input type="radio" name="model" value="weapon">
+          <div class="model-opt-icon">🔫</div>
+          <div class="model-opt-name">Gun Only</div>
+          <div class="model-opt-sub">Firearm detection</div>
+        </label>
+        <label class="model-opt">
+          <input type="radio" name="model" value="weapon1">
+          <div class="model-opt-icon">🗡️</div>
+          <div class="model-opt-name">All Weapons</div>
+          <div class="model-opt-sub">Gun + Knife + Grenade</div>
+        </label>
+        <label class="model-opt">
+          <input type="radio" name="model" value="face">
+          <div class="model-opt-icon">👤</div>
+          <div class="model-opt-name">Face Only</div>
+          <div class="model-opt-sub">Recognize vs database</div>
+        </label>
+      </div>
+
+      <div class="conf-wrap" id="conf-wrap">
+        <label>Confidence: <span id="conf-val">40%</span></label>
+        <input type="range" id="conf-slider" min="10" max="90" value="40"
+               oninput="document.getElementById('conf-val').textContent=this.value+'%'">
+      </div>
+
+      <button class="btn-primary" id="run-btn" onclick="runVideo()" disabled>
+        ▶ Run Detection
+      </button>
+    </div>
+
+    <!-- Progress -->
+    <div class="card hidden" id="progress-card">
+      <div class="card-label">Processing</div>
+      <div class="status-line" id="status-line">Starting...</div>
+      <div class="progress-wrap">
+        <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+      </div>
+      <div class="progress-text" id="progress-pct">0%</div>
+    </div>
+
+    <!-- Result -->
+    <div class="card hidden" id="result-card">
+      <div class="card-label">Result — Detections sent to your app</div>
+      <video class="result-video" id="result-video" controls></video>
+      <div class="result-meta" id="result-meta"></div>
+      <a class="dl-btn" id="dl-btn" href="#" download>⬇ Download Output Video</a>
     </div>
   </div>
+
+  <!-- ─── WEBCAM TAB ────────────────────────────────────── -->
+  <div id="tab-webcam" class="hidden">
+    <div class="card">
+      <div class="card-label">Live Webcam — PC Camera</div>
+      <img class="webcam-feed" id="webcam-feed" src="" alt="Webcam feed">
+      <div class="webcam-status">
+        <span class="status-dot" id="wcam-dot"></span>
+        <span id="wcam-status">Webcam stopped</span>
+      </div>
+      <div style="display:flex;gap:12px;margin-top:16px">
+        <button class="btn-primary btn-green" id="wcam-start" onclick="startWebcam()"
+                style="flex:1">▶ Start Webcam</button>
+        <button class="btn-primary btn-red hidden" id="wcam-stop" onclick="stopWebcam()"
+                style="flex:1">■ Stop Webcam</button>
+      </div>
+      <p style="font-size:12px;color:#94a3b8;margin-top:12px">
+        Detects faces (vs your faces/ database), weapons and violence in real time.
+        Stranger faces and threats are automatically sent to your SecretEye app as alerts.
+      </p>
+    </div>
+  </div>
+
+  <!-- ─── ALERTS TAB ────────────────────────────────────── -->
+  <div id="tab-alerts" class="hidden">
+    <div class="card">
+      <div class="card-label">Recent Detections — This Session</div>
+      <div class="alert-feed" id="alert-feed">
+        <div style="text-align:center;padding:32px;color:#94a3b8;font-size:14px">
+          No detections yet in this session.
+        </div>
+      </div>
+    </div>
+  </div>
+
 </div>
+
 <script>
-const UID = "{{ uid }}";
-async function refreshCameras(){
+let currentFile = null;
+let pollTimer   = null;
+let wcamRunning = false;
+let alertLog    = [];
+
+// Face DB status
+fetch('/face-db-status').then(r=>r.json()).then(d=>{
+  const el = document.getElementById('face-db-txt');
+  const bd = document.getElementById('face-db-badge');
+  if (d.count===0){
+    bd.className='face-db-badge empty';
+    el.textContent='⚠ No faces in database — add images to backend/faces/ folder';
+  } else {
+    el.textContent=`👤 Face database: ${d.count} person(s) — ${d.names.join(', ')}`;
+  }
+});
+
+// Model card selection
+document.querySelectorAll('.model-opt').forEach(opt=>{
+  opt.addEventListener('click',()=>{
+    document.querySelectorAll('.model-opt').forEach(o=>o.classList.remove('sel'));
+    opt.classList.add('sel');
+    const v = opt.querySelector('input').value;
+    document.getElementById('conf-wrap').style.display = v==='face' ? 'none' : 'block';
+  });
+});
+
+// Upload
+const dz = document.getElementById('drop-zone');
+const fi = document.getElementById('file-input');
+dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag')});
+dz.addEventListener('dragleave',()=>dz.classList.remove('drag'));
+dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('drag');
+  if(e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0])});
+fi.addEventListener('change',()=>{if(fi.files[0]) handleFile(fi.files[0])});
+
+function handleFile(file){
+  currentFile=file;
+  const badge=document.getElementById('file-badge');
+  badge.textContent=`📄 ${file.name}  ·  ${(file.size/1024/1024).toFixed(1)} MB`;
+  badge.style.display='block';
+  document.getElementById('run-btn').disabled=false;
+  document.getElementById('result-card').classList.add('hidden');
+}
+
+// Tab switching
+function switchTab(tab, btn){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  btn.classList.add('active');
+  ['video','webcam','alerts'].forEach(t=>{
+    document.getElementById('tab-'+t).classList.toggle('hidden', t!==tab);
+  });
+  if(tab==='alerts') refreshAlerts();
+}
+
+// Run video detection
+async function runVideo(){
+  if(!currentFile) return;
+  const model = document.querySelector('input[name=model]:checked').value;
+  const conf  = document.getElementById('conf-slider').value/100;
+
+  document.getElementById('run-btn').disabled=true;
+  document.getElementById('progress-card').classList.remove('hidden');
+  document.getElementById('result-card').classList.add('hidden');
+  document.getElementById('progress-fill').style.width='0%';
+  document.getElementById('status-line').textContent='Uploading...';
+
+  const fd=new FormData();
+  fd.append('video',currentFile);
+  fd.append('model',model);
+  fd.append('conf',conf);
+
   try{
-    const d=await(await fetch('/status?uid='+UID)).json();
-    const keys=Object.keys(d).filter(k=>d[k].alive&&d[k].has_frame);
-    const grid=document.getElementById('grid');
-    if(!keys.length){
-      grid.innerHTML='<div class="empty">📷<br><br>No active cameras.<br>Make sure your cameras are set to Active in the app.</div>';
-      return;
+    const resp=await fetch('/process',{method:'POST',body:fd});
+    const data=await resp.json();
+    if(data.error) throw new Error(data.error);
+    pollJob(data.job_id);
+  }catch(e){
+    document.getElementById('status-line').textContent='❌ '+e.message;
+    document.getElementById('run-btn').disabled=false;
+  }
+}
+
+function pollJob(jobId){
+  pollTimer=setInterval(async()=>{
+    const d=await(await fetch('/progress/'+jobId)).json();
+    document.getElementById('progress-fill').style.width=(d.progress||0)+'%';
+    document.getElementById('progress-pct').textContent=(d.progress||0)+'%';
+    document.getElementById('status-line').textContent=d.message||'Processing...';
+    if(d.status==='done'){
+      clearInterval(pollTimer);
+      showResult(d,jobId);
+    } else if(d.status==='error'){
+      clearInterval(pollTimer);
+      document.getElementById('status-line').textContent='❌ '+d.message;
+      document.getElementById('run-btn').disabled=false;
     }
-    if(grid.querySelector('.empty')) grid.innerHTML='';
-    keys.forEach(key=>{
-      const parts=key.split('_');
-      const uid=parts[0]; const name=parts.slice(1).join(' ');
-      if(uid!==UID) return; // only show this user's cameras
-      let card=document.getElementById('c-'+key);
-      if(!card){
-        card=document.createElement('div');
-        card.className='cam-card'; card.id='c-'+key;
-        card.innerHTML=`<img id="i-${key}" src="" alt="${name}"><div class="cam-label"><span class="live-dot"></span>${name.toUpperCase()}</div>`;
-        grid.appendChild(card);
-      }
-      const img=document.getElementById('i-'+key);
-      if(img) img.src=`/snapshot?userId=${uid}&device=${encodeURIComponent(name)}&t=${Date.now()}`;
-    });
-  }catch(e){console.log('cam err',e)}
+  },800);
 }
+
+function showResult(d,jobId){
+  document.getElementById('progress-card').classList.add('hidden');
+  document.getElementById('result-card').classList.remove('hidden');
+  document.getElementById('run-btn').disabled=false;
+  const vid=document.getElementById('result-video');
+  vid.src='/output/'+jobId+'?t='+Date.now();
+  vid.load();
+  document.getElementById('dl-btn').href='/output/'+jobId;
+  document.getElementById('dl-btn').download=d.filename||'output.mp4';
+  document.getElementById('result-meta').innerHTML=`
+    <div class="meta-it"><span>Frames:</span><span>${d.frames}</span></div>
+    <div class="meta-it"><span>Time:</span><span>${d.elapsed}s</span></div>
+    <div class="meta-it"><span>Saved:</span><span>runs/detect/</span></div>
+  `;
+  vid.scrollIntoView({behavior:'smooth'});
+}
+
+// Webcam
+async function startWebcam(){
+  const resp=await fetch('/webcam/start',{method:'POST'});
+  const d=await resp.json();
+  if(d.started){
+    wcamRunning=true;
+    document.getElementById('wcam-start').classList.add('hidden');
+    document.getElementById('wcam-stop').classList.remove('hidden');
+    document.getElementById('wcam-dot').className='status-dot live';
+    document.getElementById('wcam-status').textContent='LIVE — AI detecting...';
+    streamWebcam();
+  } else {
+    alert(d.error||'Could not start webcam');
+  }
+}
+
+async function stopWebcam(){
+  await fetch('/webcam/stop',{method:'POST'});
+  wcamRunning=false;
+  document.getElementById('wcam-start').classList.remove('hidden');
+  document.getElementById('wcam-stop').classList.add('hidden');
+  document.getElementById('wcam-dot').className='status-dot';
+  document.getElementById('wcam-status').textContent='Webcam stopped';
+  document.getElementById('webcam-feed').src='';
+}
+
+function streamWebcam(){
+  if(!wcamRunning) return;
+  const img=document.getElementById('webcam-feed');
+  img.src='/webcam/frame?t='+Date.now();
+  img.onload=()=>{ if(wcamRunning) setTimeout(streamWebcam,80); };
+  img.onerror=()=>{ if(wcamRunning) setTimeout(streamWebcam,500); };
+}
+
+// Alerts
 async function refreshAlerts(){
-  try{
-    const d=await(await fetch('/recent-detections?uid='+UID)).json();
-    const el=document.getElementById('alerts');
-    if(!d.length){el.innerHTML='<div class="empty">No detections yet.<br>AI is monitoring…</div>';return;}
-    el.innerHTML=d.map(a=>`<div class="alert-card">
-      ${a.image_b64?`<img src="${a.image_b64}">`:''}
-      <div class="alert-meta">
-        <div class="alert-type ${a.type}">⚠ ${a.type.toUpperCase()}</div>
-        <div class="alert-info">${a.device} · ${a.time}</div>
-      </div></div>`).join('');
-  }catch(e){console.log('alerts err',e)}
+  const d=await(await fetch('/session-alerts')).json();
+  const el=document.getElementById('alert-feed');
+  if(!d.length){
+    el.innerHTML='<div style="text-align:center;padding:32px;color:#94a3b8;font-size:14px">No detections yet in this session.</div>';
+    return;
+  }
+  const icons={Weapon:'🔫',Violence:'⚡',Stranger:'👤'};
+  el.innerHTML=d.map(a=>`
+    <div class="alert-item">
+      <span class="alert-icon">${icons[a.type]||'⚠'}</span>
+      <div class="alert-text">
+        <div class="alert-type ${a.type}">${a.type.toUpperCase()}</div>
+        <div class="alert-meta">${a.source} · ${a.time}</div>
+      </div>
+    </div>`).join('');
 }
-refreshCameras(); refreshAlerts();
-setInterval(refreshCameras,1500);
-setInterval(refreshAlerts,4000);
 </script>
 </body>
 </html>"""
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Flask Routes
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─── Web Routes ───────────────────────────────────────────────────────────────
+# Per-session alert log (in memory)
+session_alerts = {}  # user_id → list
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET","POST"])
 def login_page():
-    """Login page — authenticates against Firebase Auth."""
     if "user" in session:
-        return redirect(url_for("monitor"))
-
-    error = None
+        return redirect(url_for("main"))
+    error = ""
     email = ""
-
     if request.method == "POST":
-        email    = request.form.get("email", "").strip()
-        password = request.form.get("password", "").strip()
-
+        email    = request.form.get("email","").strip()
+        password = request.form.get("password","").strip()
         if not email or not password:
             error = "Please enter both email and password."
         else:
             user = firebase_sign_in(email, password)
             if user:
                 session["user"] = user
-                # Start only this user's camera workers in background
-                threading.Thread(
-                    target=start_user_devices,
-                    args=(user["uid"],),
-                    daemon=True
-                ).start()
-                log.info(f"✅ Web login: {email} (uid={user['uid']})")
-                return redirect(url_for("monitor"))
+                session_alerts[user["uid"]] = []
+                log.info(f"✅ Login: {email}")
+                return redirect(url_for("main"))
             else:
-                error = "Incorrect email or password. Try again."
-
+                error = "Incorrect email or password."
     return render_template_string(LOGIN_HTML, error=error, email=email)
-
 
 @app.route("/logout")
 def logout():
-    """Stop user's workers and clear session."""
     user = session.get("user")
     if user:
-        threading.Thread(
-            target=stop_user_devices,
-            args=(user["uid"],),
-            daemon=True
-        ).start()
-        log.info(f"■ Web logout: {user['email']}")
+        # Stop webcam if running for this user
+        if webcam_state["running"] and webcam_state["user_id"] == user["uid"]:
+            webcam_state["stop"].set()
     session.clear()
     return redirect(url_for("login_page"))
 
-
-@app.route("/monitor")
+@app.route("/hub")
 @login_required
-def monitor():
-    """Web dashboard — protected, shows only logged-in user's streams."""
+def main():
     user = session["user"]
-    return render_template_string(
-        MONITOR_HTML,
-        uid=user["uid"],
-        display_name=user.get("displayName", user["email"]),
-    )
+    return render_template_string(MAIN_HTML,
+        user_name=user.get("name", user["email"]))
 
+@app.route("/face-db-status")
+@login_required
+def face_db_status():
+    return jsonify({"count": len(known_names), "names": known_names})
 
-# ─── API Endpoints ────────────────────────────────────────────────────────────
+@app.route("/session-alerts")
+@login_required
+def get_session_alerts():
+    uid = session["user"]["uid"]
+    return jsonify(session_alerts.get(uid, []))
 
-@app.route("/health")
-def health():
-    active=[k for k,t in worker_threads.items() if t.is_alive()]
-    return jsonify({"status":"online","active_workers":active,
-        "model_classes":{"weapon":weapon_model.names,"fight":fight_model.names}})
+# ─── Video processing ─────────────────────────────────────────────────────────
 
+@app.route("/process", methods=["POST"])
+@login_required
+def process():
+    user     = session["user"]
+    video    = request.files.get("video")
+    model_id = request.form.get("model", "all")
+    conf     = float(request.form.get("conf", 0.40))
 
-@app.route("/recent-detections")
-def recent_detections_endpoint():
-    # uid param for web monitor; falls back to session user
-    uid = request.args.get("uid", "")
-    if not uid and "user" in session:
-        uid = session["user"]["uid"]
-    with recent_lock:
-        return jsonify(list(recent_detections.get(uid, [])))
+    if not video:
+        return jsonify({"error": "No video uploaded"}), 400
 
+    job_id   = str(uuid.uuid4())[:8]
+    ext      = os.path.splitext(video.filename)[1] or ".mp4"
+    tmp_path = os.path.join(UPLOAD_DIR, f"{job_id}{ext}")
+    video.save(tmp_path)
 
-@app.route("/raw-snapshot")
-def raw_snapshot():
-    uid  = request.args.get("userId","").strip()
-    name = request.args.get("device","").strip()
-    if not uid or not name:
-        return jsonify({"error":"userId and device required"}),400
-    key=f"{uid}_{name}"
-    ensure_worker_running(uid,name)
-    frame=raw_frames.get(key)
-    if frame is None:
-        ph=np.zeros((240,320,3),dtype=np.uint8)
-        cv2.putText(ph,"Connecting...",(55,110),cv2.FONT_HERSHEY_SIMPLEX,0.8,(80,80,80),2)
-        _,buf=cv2.imencode(".jpg",ph)
-    else:
-        _,buf=cv2.imencode(".jpg",frame,[cv2.IMWRITE_JPEG_QUALITY,STREAM_QUALITY])
-    resp=Response(buf.tobytes(),mimetype="image/jpeg")
-    resp.headers.update({"Cache-Control":"no-cache, no-store","Pragma":"no-cache","Expires":"0"})
-    return resp
+    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join("runs", "detect", f"{model_id}_{ts}")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"output_{job_id}.mp4")
 
+    jobs[job_id] = {
+        "status": "queued", "progress": 0,
+        "message": "Queued...", "output_path": out_path,
+        "filename": f"output_{job_id}.mp4",
+    }
 
-@app.route("/snapshot")
-def snapshot():
-    uid  = request.args.get("userId","").strip()
-    name = request.args.get("device","").strip()
-    if not uid or not name:
-        return jsonify({"error":"userId and device required"}),400
-    key=f"{uid}_{name}"
-    ensure_worker_running(uid,name)
-    frame=latest_frames.get(key)
-    if frame is None:
-        ph=np.zeros((240,320,3),dtype=np.uint8)
-        cv2.putText(ph,"AI Hub Starting...",(40,120),cv2.FONT_HERSHEY_SIMPLEX,0.7,(100,100,100),2)
-        _,buf=cv2.imencode(".jpg",ph)
-    else:
-        _,buf=cv2.imencode(".jpg",frame,[cv2.IMWRITE_JPEG_QUALITY,STREAM_QUALITY])
-    resp=Response(buf.tobytes(),mimetype="image/jpeg")
-    resp.headers.update({"Cache-Control":"no-cache, no-store","Pragma":"no-cache","Expires":"0"})
-    return resp
+    source_name = os.path.splitext(video.filename)[0] or "Upload"
 
+    def _run():
+        # Wrap save_detection to also log to session_alerts
+        original_save = save_detection
+        def patched_save(uid, sname, dtype, frame, cooldown):
+            original_save(uid, sname, dtype, frame, cooldown)
+            if uid not in session_alerts:
+                session_alerts[uid] = []
+            session_alerts[uid].insert(0, {
+                "type":   dtype,
+                "source": sname,
+                "time":   time.strftime("%H:%M:%S"),
+            })
+            if len(session_alerts[uid]) > 50:
+                session_alerts[uid].pop()
 
-@app.route("/video_feed")
-def video_feed():
-    uid  = request.args.get("userId","").strip()
-    name = request.args.get("device","").strip()
-    if not uid or not name:
-        return jsonify({"error":"userId and device required"}),400
-    key=f"{uid}_{name}"; ensure_worker_running(uid,name)
-    def generate():
-        ph=None
-        while True:
-            frame=latest_frames.get(key)
-            if frame is None:
-                if ph is None:
-                    p=np.zeros((320,480,3),dtype=np.uint8)
-                    cv2.putText(p,"Connecting...",(100,160),cv2.FONT_HERSHEY_SIMPLEX,0.9,(80,80,80),2)
-                    _,b=cv2.imencode(".jpg",p); ph=b.tobytes()
-                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"+ph+b"\r\n"
-            else:
-                _,buf=cv2.imencode(".jpg",frame,[cv2.IMWRITE_JPEG_QUALITY,STREAM_QUALITY])
-                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"+buf.tobytes()+b"\r\n"
-            time.sleep(STREAM_FPS_CAP)
-    return Response(generate(),mimetype="multipart/x-mixed-replace; boundary=frame")
-
-
-@app.route("/start_device",methods=["POST"])
-def start_device():
-    data=request.get_json(silent=True) or {}
-    uid=data.get("userId","").strip(); name=data.get("device","").strip()
-    if not uid or not name: return jsonify({"error":"userId and device required"}),400
-    return jsonify({"started":ensure_worker_running(uid,name),"device":name})
-
-
-@app.route("/stop_device",methods=["POST"])
-def stop_device_endpoint():
-    data=request.get_json(silent=True) or {}
-    uid=data.get("userId","").strip(); name=data.get("device","").strip()
-    if not uid or not name: return jsonify({"error":"userId and device required"}),400
-    stop_worker(uid,name)
-    return jsonify({"stopped":True,"device":name})
-
-
-@app.route("/upload-video",methods=["POST"])
-def upload_video():
-    uid=request.form.get("userId","").strip()
-    if not uid: return jsonify({"error":"userId required"}),400
-    if "video" not in request.files: return jsonify({"error":"No video file"}),400
-    vf=request.files["video"]
-    tmp=os.path.join(tempfile.gettempdir(),f"upload_{uid}_{int(time.time())}.mp4")
-    vf.save(tmp)
-    def process():
+        # Temporarily patch
+        import builtins
+        process_video_job.__globals__["save_detection"] = patched_save
         try:
-            cap=cv2.VideoCapture(tmp); n=0; g=ConfirmationGate(); cd={}
-            while True:
-                ret,frame=cap.read()
-                if not ret: break
-                n+=1
-                if n%DETECT_EVERY_N==0:
-                    yf=resize_for_yolo(frame); rd=[]
-                    try:
-                        w=weapon_model.predict(yf,conf=WEAPON_CONF,verbose=False)
-                        if w and len(w[0].boxes)>0: rd.append("Weapon")
-                    except: pass
-                    try:
-                        f=fight_model.predict(yf,conf=VIOLENCE_CONF,verbose=False,
-                            classes=[VIOLENCE_CLASS_ID] if VIOLENCE_CLASS_ID else None)
-                        if any(int(b.cls[0])==VIOLENCE_CLASS_ID for b in f[0].boxes
-                               if VIOLENCE_CLASS_ID is not None): rd.append("Violence")
-                    except: pass
-                    for label in g.update(rd): save_alert(uid,"Mobile Upload",label,frame,cd)
-            cap.release()
-            try: os.remove(tmp)
-            except: pass
-        except Exception as e: log.error(f"upload-video: {e}")
-    _alert_pool.submit(process)
-    return jsonify({"status":"processing"})
+            process_video_job(job_id, tmp_path, out_path,
+                              model_id, conf, user["uid"], source_name)
+        finally:
+            process_video_job.__globals__["save_detection"] = original_save
 
+    _pool.submit(_run)
+    return jsonify({"job_id": job_id})
 
-@app.route("/status")
-def status():
-    uid = request.args.get("uid","")
-    result = {}
-    for k,t in worker_threads.items():
-        # filter by uid if provided
-        if uid and not k.startswith(uid+"_"):
-            continue
-        result[k]={"alive":t.is_alive(),"has_frame":k in latest_frames}
-    return jsonify(result)
+@app.route("/progress/<job_id>")
+@login_required
+def progress(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(job)
 
+@app.route("/output/<job_id>")
+@login_required
+def output(job_id):
+    job = jobs.get(job_id)
+    if not job or job["status"] != "done":
+        return jsonify({"error": "Not ready"}), 404
+    return send_file(job["output_path"], mimetype="video/mp4")
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
-if __name__=="__main__":
-    log.info("🚀 SecretEye AI Hub v5.0 — http://0.0.0.0:5000")
-    log.info("🌐 Open in browser: http://YOUR_PC_IP:5000")
-    log.info("   Login with your SecretEye app credentials")
-    app.run(host="0.0.0.0",port=5000,debug=False,threaded=True)
+# ─── Webcam ───────────────────────────────────────────────────────────────────
+
+@app.route("/webcam/start", methods=["POST"])
+@login_required
+def webcam_start():
+    user = session["user"]
+    if webcam_state["running"]:
+        return jsonify({"started": True})
+
+    webcam_state["stop"]    = threading.Event()
+    webcam_state["user_id"] = user["uid"]
+    webcam_state["running"] = True
+
+    t = threading.Thread(
+        target=webcam_worker,
+        args=(user["uid"], webcam_state["stop"]),
+        daemon=True
+    )
+    t.start()
+    webcam_state["thread"] = t
+    time.sleep(0.5)
+
+    if not webcam_state["running"]:
+        return jsonify({"started": False, "error": "Could not open webcam"})
+    return jsonify({"started": True})
+
+@app.route("/webcam/stop", methods=["POST"])
+@login_required
+def webcam_stop():
+    webcam_state["stop"].set()
+    webcam_state["running"] = False
+    return jsonify({"stopped": True})
+
+@app.route("/webcam/frame")
+@login_required
+def webcam_frame():
+    frame_bytes = webcam_state.get("latest")
+    if not frame_bytes:
+        # Return placeholder
+        ph = np.zeros((240,320,3), dtype=np.uint8)
+        cv2.putText(ph,"Webcam not started",(40,120),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.6,(80,80,80),1)
+        _, buf = cv2.imencode(".jpg", ph)
+        frame_bytes = buf.tobytes()
+    resp = Response(frame_bytes, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    return resp
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    log.info("🚀 SecretEye AI Hub v6.0")
+    log.info("   Open: http://YOUR_PC_IP:5000")
+    log.info("   Login with your SecretEye mobile app credentials")
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
