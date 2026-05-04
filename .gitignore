@@ -31,7 +31,7 @@ backend/.deepface/
 
 # ===========================
 # AI MODELS (too large for GitHub)
-# Place weapon.pt, fight.pt, facenet512_weights.h5 inside backend/model/
+# Place weapon.pt, fight.pt inside backend/model/
 # ===========================
 *.pt
 *.h5
@@ -104,3 +104,11 @@ app-example/
 # ML MODELS
 # ===========================
 ml_models/
+
+# ===========================
+# BACKEND — VIDEOS & OUTPUTS
+# ===========================
+backend/video/
+backend/runs/
+backend/uploads_tmp/
+backend/faces/
