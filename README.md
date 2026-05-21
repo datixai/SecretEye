@@ -1,24 +1,24 @@
-# SecretEye 👁️ — AI-Powered Home Surveillance System
+# SecretEye AI-Powered Home Surveillance System
 
-> *The Eye That Never Sleeps*
+> The Eye That Never Sleeps
 
-SecretEye is a full-stack AI security platform built as a Final Year Project. It combines a cross-platform **React Native (Expo)** mobile app with a **Python Flask** AI backend to deliver real-time weapon detection, violence recognition, and facial identity verification — all powered by YOLO and DeepFace, with Firebase as the cloud backbone.
+SecretEye is a full-stack AI security platform built as a Final Year Project. It combines a cross-platform **React Native (Expo)** mobile app with a **Python Flask** AI backend to deliver real-time weapon detection, violence recognition, and facial identity verification — powered by YOLOv8 and face_recognition library, with Firebase as the cloud backbone.
 
 ---
 
-## 📸 Tech Stack
+## Tech Stack
 
 | Layer | Technology |
 |---|---|
 | Mobile App | React Native · Expo Router · NativeWind (Tailwind) |
-| AI Backend | Python · Flask · YOLOv8 · DeepFace (Facenet512) · OpenCV |
+| AI Backend | Python · Flask · YOLOv8 · face_recognition (dlib) · OpenCV |
 | Database | Firebase Firestore (real-time) |
 | Auth | Firebase Authentication |
 | Storage | Firebase Storage · AsyncStorage |
 
 ---
 
-## 🏗️ Project Structure
+## Project Structure
 
 ```
 SecretEye/
@@ -30,132 +30,136 @@ SecretEye/
 │   ├── signup.jsx                        # Signup + biometric face enrollment
 │   │
 │   ├── admin/                            # Admin role screens
-│   │   ├── activity.jsx                  # User management overview
-│   │   ├── dashboard.jsx                 # Admin home
-│   │   ├── devices.jsx                   # All devices across all homeowners
-│   │   ├── manageUsers.jsx               # CRUD for homeowner accounts
-│   │   ├── panic.jsx                     # Emergency response feed
-│   │   ├── reports-and-alerts.jsx        # Alert command center
-│   │   ├── settings.jsx                  # Admin profile + logout
-│   │   └── system-control.jsx            # Arm/Disarm + zone toggles
+│   │   ├── activity.jsx
+│   │   ├── dashboard.jsx
+│   │   ├── devices.jsx
+│   │   ├── manageUsers.jsx
+│   │   ├── panic.jsx
+│   │   ├── reports-and-alerts.jsx
+│   │   ├── settings.jsx
+│   │   └── system-control.jsx
 │   │
 │   └── homeowner/                        # Homeowner role screens
-│       ├── activity.jsx                  # Live Firestore detection feed + push notifications
-│       ├── dashboard.jsx                 # Homeowner home
-│       ├── devices.jsx                   # Add nodes, view AI MJPEG streams
-│       ├── evidence.jsx                  # Detection image gallery (download/share)
-│       ├── manage-zones.jsx              # Security zone configuration
+│       ├── activity.jsx                  # Live Firestore detection feed
+│       ├── dashboard.jsx
+│       ├── devices.jsx                   # Add cameras, view live streams
+│       ├── evidence.jsx                  # Detection image gallery
+│       ├── manage-zones.jsx
 │       ├── panic.jsx                     # One-touch emergency broadcast
-│       ├── reportAlerts.jsx              # Reports & alerts screen
-│       ├── reports.jsx                   # Security reports screen
-│       ├── settings.jsx                  # AI engine toggles + notification prefs
-│       ├── surveillance.jsx              # Camera zone overview
-│       └── trusted-visitors.jsx          # Whitelist management with face photos
+│       ├── reportAlerts.jsx
+│       ├── reports.jsx
+│       ├── settings.jsx
+│       ├── surveillance.jsx
+│       └── trusted-visitors.jsx
 │
 ├── assets/
-│   ├── aiSecurity.mp4                    # Landing screen background video
-│   ├── ai-security.mp4                   # Video asset
-│   ├── logo.png                          # App logo (root level)
+│   ├── aiSecurity.mp4
+│   ├── logo.png
 │   └── images/
-│       ├── android-icon-background.png   # Adaptive icon (app.json)
-│       ├── android-icon-foreground.png   # Adaptive icon (app.json)
-│       ├── android-icon-monochrome.png   # Adaptive icon (app.json)
-│       ├── favicon.png                   # Web build favicon
-│       ├── logo.png                      # App logo (images folder)
-│       ├── partial-react-logo.png        # Expo default asset
-│       ├── react-logo.png                # Expo default asset
-│       ├── react-logo@2x.png             # Expo default asset
-│       ├── react-logo@3x.png             # Expo default asset
-│       ├── sddefault.jpg                 # Image asset
-│       └── splash-icon.png               # Splash screen (app.json)
+│       ├── android-icon-background.png
+│       ├── android-icon-foreground.png
+│       ├── android-icon-monochrome.png
+│       ├── splash-icon.png
+│       └── favicon.png
 │
-├── backend/                              # Python AI Hub (runs on local PC/server)
-│   ├── app.py                            # Main Flask server — YOLO + DeepFace + Firebase
-│   ├── download.py                       # One-time model setup script
-│   ├── serviceAccountKey.json            # ⚠️ NOT committed — see Environment Setup
-│   └── model/
-│       ├── facenet512_weights.h5         # DeepFace Facenet512 weights
-│       ├── fight.pt                      # YOLOv8 violence detection model
-│       └── weapon.pt                     # YOLOv8 weapon detection model
+├── backend/                              # Python AI Hub
+│   ├── app.py                            # Main Flask server — AI + Firebase
+│   ├── downloadmodel.py                  # Download YOLO models from HuggingFace
+│   ├── web.py                            # Standalone AI test web app (port 5002)
+│   ├── test_lab.py                       # Single-file AI test lab (port 5001)
+│   ├── test_face.py                      # Face recognition test script
+│   ├── test_fight.py                     # Violence model test script
+│   ├── test_weapon.py                    # Gun model test script
+│   ├── test_weapon1.py                   # Multi-weapon model test script
+│   ├── classes.py                        # Print model class names
+│   ├── requirements.txt                  # Exact package versions
+│   ├── serviceAccountKey.json            # NOT committed — see Environment Setup
+│   ├── faces/                            # NOT committed — face reference images
+│   │   └── person_name.jpg               # Filename = person name
+│   ├── model/                            # NOT committed — AI model weights
+│   │   ├── weapon.pt                     # YOLOv8 gun detection
+│   │   ├── weapon1.pt                    # YOLOv8 gun+knife+grenade detection
+│   │   └── fight.pt                      # YOLOv8 violence detection
+│   ├── video/                            # NOT committed — test videos
+│   └── runs/                             # NOT committed — detection output videos
 │
-├── components/                           # Shared UI components
+├── components/
 │   ├── AlertCard.jsx
 │   ├── CustomButton.jsx
 │   ├── CustomInput.jsx
 │   ├── DashboardCard.jsx
-│   ├── HomeFooter.jsx                    # Role-aware bottom nav bar
+│   ├── HomeFooter.jsx
 │   ├── HomeownerDBCard.jsx
 │   └── RoleSelector.jsx
 │
 ├── lib/
-│   └── firebase.js                       # Firebase client SDK init (hybrid web/native auth)
+│   └── firebase.js                       # NOT committed — Firebase client init
 │
-├── app.json                              # Expo config (icons, splash, permissions)
+├── app.json
 ├── babel.config.js
-├── eslint.config.js
-├── expo-env.d.ts
-├── global.css
 ├── metro.config.js
-├── nativewind-env.d.ts
 ├── package.json
-├── package-lock.json
-├── README.md
 ├── tailwind.config.js
-└── tsconfig.json
+└── README.md
 ```
 
 ---
 
-## ⚙️ How It Works
+## How It Works
 
 ```
-Mobile App  ──(Firestore)──►  Firebase Cloud
-    │                              │
-    │  /video_feed?userId=&device= │  writes detections/{}
-    ▼                              ▼
-Python AI Hub (app.py)  ──────── Firebase Admin SDK
+Mobile App  ──(Firestore realtime)──►  Firebase Cloud
+                                              │
+                                     writes detections/{}
+                                              │
+Python AI Hub (app.py)  ──── Firebase Admin SDK
     │
-    ├── YOLOv8 (weapon.pt)      → Weapon detection @ 0.70 conf
-    ├── YOLOv8 (fight.pt)       → Violence detection @ 0.65 conf
-    └── DeepFace (Facenet512)   → Face identity vs. homeowner reference
+    ├── Web Login          → Firebase Auth REST API
+    ├── Video Upload       → YOLO inference → evidence frames → Firestore
+    ├── Live Webcam        → Face recognition + YOLO → Firestore alerts
+    ├── face_recognition   → Compare vs faces/ folder → Stranger / Name
+    ├── YOLOv8 weapon.pt   → Gun detection
+    ├── YOLOv8 weapon1.pt  → Gun + Knife + Grenade detection
+    └── YOLOv8 fight.pt    → Violence / fight detection
 ```
 
-1. The homeowner adds a camera node (IP address) via the app.
-2. The AI Hub (`app.py`) opens an MJPEG stream from that IP.
-3. Every 4 frames: YOLO runs weapon + violence inference with a **3-frame confirmation gate** to suppress false positives.
-4. Every 40 frames: DeepFace verifies faces against the homeowner's registered face photo stored in Firestore.
-5. On confirmed detection: an alert document is written to `detections/` in Firestore with a base64 snapshot.
-6. The mobile app listens in real-time via `onSnapshot` and fires a local push notification.
+1. User logs into the web dashboard at `http://PC_IP:5000` with their SecretEye credentials.
+2. They upload a video or start the live webcam.
+3. AI models run on every frame — weapon, violence, and face recognition simultaneously.
+4. On confirmed detection — an alert is written to `detections/` in Firestore with a base64 evidence frame.
+5. The mobile app listens in real-time via `onSnapshot` and shows the alert in the Activity and Evidence screens.
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 
 - Node.js 18+
 - Python 3.11
-- Expo Go app (for mobile testing) or Android/iOS emulator
+- Android phone (for APK installation)
 - A Firebase project with Firestore, Auth, and Storage enabled
 
 ---
 
+## Part 1 — Mobile App Setup
+
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/secreteye.git
-cd secreteye
+git clone https://github.com/datixai/SecretEye.git
+cd SecretEye
 ```
 
----
-
-### 2. Mobile App Setup
+### 2. Install JS Dependencies
 
 ```bash
 npm install
 ```
 
-Create a `.env.local` file in the root and add your Firebase web config:
+### 3. Create Environment File
+
+Create `.env.local` in the root `SecretEye/` folder:
 
 ```env
 EXPO_PUBLIC_FIREBASE_API_KEY=your_api_key
@@ -166,112 +170,303 @@ EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=your_sender_id
 EXPO_PUBLIC_FIREBASE_APP_ID=your_app_id
 ```
 
-Start the app:
+Get these values from: Firebase Console → Project Settings → General → Your Apps → Web App
 
-```bash
-npx expo start
+### 4. Create lib/firebase.js
+
+Create `lib/firebase.js` (gitignored — must be created manually):
+
+```js
+import { initializeApp } from "firebase/app";
+import { getFirestore } from "firebase/firestore";
+import { getAuth } from "firebase/auth";
+
+const firebaseConfig = {
+  apiKey:            process.env.EXPO_PUBLIC_FIREBASE_API_KEY,
+  authDomain:        process.env.EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId:         process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID,
+  storageBucket:     process.env.EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+  appId:             process.env.EXPO_PUBLIC_FIREBASE_APP_ID,
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+export const db   = getFirestore(firebaseApp);
+export const auth = getAuth(firebaseApp);
 ```
 
-Scan the QR code with Expo Go, or press `a` for Android emulator / `i` for iOS simulator.
+### 5. Build and Install APK on Android Phone
+
+Enable Wireless Debugging on the phone:
+- Settings → Developer Options → Wireless Debugging → Enable
+- Note the IP address and port shown (e.g. `192.168.1.115:40621`)
+
+Connect phone via ADB:
+```powershell
+adb connect 192.168.1.115:40621
+adb devices
+```
+
+Set Java home and build the release APK:
+```powershell
+$env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
+npx expo run:android --variant release
+```
+
+First release build takes 30-60 minutes (compiling native modules). Future builds take 3-5 minutes from cache.
+
+APK is saved at:
+```
+android/app/build/outputs/apk/release/app-release.apk
+```
+
+To manually install on phone after build:
+```powershell
+adb install -r android/app/build/outputs/apk/release/app-release.apk
+```
+
+To send APK to client — share `app-release.apk` via WhatsApp or USB. Client enables "Install from unknown sources" in phone settings and taps the file to install.
 
 ---
 
-### 3. Python AI Backend Setup
+## Part 2 — Python AI Backend Setup
 
-```bash
-cd backend
+### 1. Navigate to Backend Folder
+
+```powershell
+cd D:\SecretEye\backend
+```
+
+### 2. Create Virtual Environment
+
+```powershell
 python -m venv venv
-
-# Windows
 venv\Scripts\activate
-# macOS / Linux
-source venv/bin/activate
-
-pip install flask flask-cors firebase-admin ultralytics deepface opencv-python
 ```
 
-Place your Firebase Admin SDK key:
+### 3. Install Dependencies
 
-```
-backend/serviceAccountKey.json   ← download from Firebase Console > Project Settings > Service Accounts
-```
-
-Download the AI model weights (first time only):
-
-```bash
-python download.py
+```powershell
+pip install -r requirements.txt
 ```
 
-> This downloads `facenet512_weights.h5` into `model/`. `weapon.pt` and `fight.pt` must be placed in `model/` manually.
+If `requirements.txt` is not available, install manually:
 
-Start the AI Hub:
+```powershell
+pip install flask flask-cors firebase-admin ultralytics opencv-python face_recognition Pillow requests numpy
+```
 
-```bash
+> Note: `face_recognition` requires `dlib` which compiles from source. If compilation fails due to missing Visual Studio, install the pre-built wheel:
+> Send `dlib-20.0.1-cp311-cp311-win_amd64.whl` to the client and install:
+> ```powershell
+> pip install dlib-20.0.1-cp311-cp311-win_amd64.whl
+> pip install face_recognition
+> ```
+
+### 4. Place Firebase Service Account Key
+
+Download from: Firebase Console → Project Settings → Service Accounts → Generate New Private Key
+
+Save as:
+```
+D:\SecretEye\backend\serviceAccountKey.json
+```
+
+### 5. Download AI Models
+
+```powershell
+python downloadmodel.py
+```
+
+This downloads `weapon.pt` and `fight.pt` from HuggingFace into `model/` folder.
+
+For the multi-weapon model (knife, grenade, gun):
+```powershell
+python weapon1.py
+```
+
+### 6. Add Face Reference Images
+
+Create the `faces/` folder inside `backend/`:
+```
+backend/faces/
+    ahmed.jpg       # recognized as "Ahmed"
+    john.jpg        # recognized as "John"
+    sara.png        # recognized as "Sara"
+```
+
+Filename without extension = person's display name. Use clear front-facing photos.
+
+### 7. Start the AI Hub
+
+```powershell
 python app.py
 ```
 
-The server starts on `http://0.0.0.0:5000`. Update the `SERVER` constant in `app/homeowner/devices.jsx` to match your PC's local IP:
+Open in any browser on the same network:
+```
+http://YOUR_PC_IP:5000
+```
 
-```js
-const SERVER = "http://192.168.x.x:5000";
+Login with your SecretEye mobile app email and password.
+
+---
+
+## Part 3 — AI Web Hub Usage
+
+After logging in at `http://YOUR_PC_IP:5000`:
+
+### Video Analysis Tab
+- Upload any MP4, AVI, or MOV video
+- Select a detection model:
+  - **All Models** — weapon + violence + face recognition together
+  - **Violence** — fight/violence detection only
+  - **Gun Only** — firearm detection only
+  - **All Weapons** — gun + knife + grenade
+  - **Face Only** — identify people vs faces/ database
+- Adjust confidence threshold with the slider
+- Click Run Detection — progress bar shows frame-by-frame progress
+- Output video with bounding boxes plays in browser when complete
+- Every detection is automatically sent to Firestore — visible in mobile app Activity and Evidence screens
+- Output video also saved locally to `runs/detect/`
+
+### Live Webcam Tab
+- Click Start Webcam to open the PC camera
+- AI runs in real time — face recognition every 3 frames, weapon/violence every 4 frames
+- Stranger faces and threats send alerts to Firestore automatically
+- Click Stop Webcam when done
+
+### Recent Alerts Tab
+- Shows all detections from the current session
+
+---
+
+## Part 4 — Test Scripts
+
+Run individual model tests from the `backend/` folder:
+
+```powershell
+# Test violence model on a video
+python test_fight.py
+
+# Test gun model
+python test_weapon.py
+
+# Test multi-weapon model (knife, gun, grenade)
+python test_weapon1.py
+
+# Test face recognition
+python test_face.py
+
+# Check model class names
+python classes.py
+
+# Standalone AI test website (port 5001 — no login required)
+python test_lab.py
+# Open: http://localhost:5001
+
+# Standalone video detection web app (port 5002)
+python web.py
+# Open: http://localhost:5002
 ```
 
 ---
 
-## 🔐 Environment Setup & Security
+## AI Models
 
-The following are **gitignored** and must never be committed:
+| Model | File | Classes | Source |
+|---|---|---|---|
+| Gun Detection | `model/weapon.pt` | Gun | HuggingFace: Subh775/Firearm_Detection_Yolov8n |
+| Multi-Weapon | `model/weapon1.pt` | Gun, knife, grenade, explosion | HuggingFace: Subh775/Threat-Detection-YOLOv8n |
+| Violence | `model/fight.pt` | non_violence, violence | HuggingFace: Musawer14/fight_detection_yolov8 |
+| Face Recognition | face_recognition library | Any person in faces/ folder | dlib HOG + 128-d face encoding |
+
+Default confidence thresholds in `app.py`:
+```python
+WEAPON_CONF  = 0.40
+VIOLENCE_CONF = 0.40
+FACE_TOLERANCE = 0.50   # lower = stricter matching
+```
+
+---
+
+## Environment Setup and Security
+
+The following files are gitignored and must be created manually on each PC:
 
 | File / Folder | Reason |
 |---|---|
-| `backend/serviceAccountKey.json` | Firebase Admin private key — full database access |
-| `.env` / `.env.local` | API keys and secrets |
-| `venv/` | Python virtual environment |
+| `backend/serviceAccountKey.json` | Firebase Admin private key |
+| `.env.local` | Firebase API keys |
+| `lib/firebase.js` | Firebase client config |
+| `venv/` or `.venv/` | Python virtual environment |
 | `node_modules/` | JS dependencies |
-| `.expo/` | Auto-generated by Expo |
+| `android/` | Android build output |
 | `backend/model/*.pt` | Large binary model files |
-| `backend/model/*.h5` | Large binary model files |
-| `backend/.deepface/` | Auto-generated weights cache by `app.py` at runtime |
+| `backend/faces/` | Personal face reference photos |
+| `backend/video/` | Test videos |
+| `backend/runs/` | Detection output videos |
 
 ---
 
-## 👥 User Roles
+## Firestore Rules
+
+Firestore security rules expire every 30 days. If the app shows a white screen or permission errors, republish rules:
+
+Firebase Console → Firestore → Rules → Publish:
+
+```javascript
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}
+```
+
+---
+
+## User Roles
 
 | Role | Access |
 |---|---|
-| **Admin** | Full system view: all users, all devices, all alerts, system arm/disarm |
-| **Homeowner** | Own cameras, own detections, trusted visitors, evidence gallery, panic button |
+| Admin | Full system view — all users, all devices, all alerts |
+| Homeowner | Own cameras, own detections, evidence gallery, panic button |
 
-Role is stored in Firestore under `users/{uid}.role` and set at signup. The `_layout.jsx` enforces role-based routing on every navigation event.
-
----
-
-## 🧠 AI Detection Details
-
-| Threat | Model | Confidence Threshold | Confirmation Gate |
-|---|---|---|---|
-| Weapon | `weapon.pt` (YOLOv8) | 0.70 | 3 consecutive frames |
-| Violence | `fight.pt` (YOLOv8) | 0.65 | 3 consecutive frames |
-| Stranger | DeepFace Facenet512 | cosine distance < 0.38 | Per-frame |
-
-- **Alert cooldown:** 60 seconds per threat type per device (prevents alert spam)
-- **Tracking:** Confirmed bounding boxes persist on screen for 3 seconds without re-detection
-- **Face pipeline:** Haar cascade pre-filter → BGR→RGB conversion → Facenet512 cosine verify
+Role is stored in Firestore under `users/{uid}.role` and set at signup. `_layout.jsx` enforces role-based routing on every navigation event.
 
 ---
 
-## 📱 Key Features
+## Keystore (APK Signing)
 
-- **Biometric Signup** — Face photo captured and stored as base64 in Firestore at registration
-- **Remember Me** — Persistent login via AsyncStorage with explicit opt-in
-- **Fullscreen Camera View** — Tap any device card to expand the AI stream
-- **Evidence Gallery** — Every detection saves a JPEG snapshot; downloadable and shareable
-- **Panic Button** — Long-press triggers an emergency alert in Firestore + prompts a call to 15
-- **Trusted Visitors** — Whitelist management with profile photos stored in Firestore
-- **Auto Cleanup** — Activity logs older than 7 days are automatically deleted from Firestore
+The release APK is signed with a keystore file:
+
+```
+Location:  android/app/secreteye.keystore
+Password:  Ahmed1
+Alias:     secreteye
+```
+
+Keep this file backed up. Losing it means you cannot update the app on phones that have the current version installed.
 
 ---
 
-## 📄 License
+## Daily Server Startup
 
-This project was developed as a Final Year Project (FYP). All rights reserved.
+```powershell
+cd D:\SecretEye\backend
+venv\Scripts\activate
+python app.py
+```
+
+Open browser: `http://YOUR_PC_IP:5000`
+
+Stop server: `Ctrl + C`
+
+---
+
+## License
+
+This project was developed as a Final Year Project (FYP) by Ahmed Ali under the brand Datix AI. All rights reserved.
