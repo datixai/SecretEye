@@ -1,0 +1,4 @@
+node_modules/
+work/
+demo-account.json
+*.log

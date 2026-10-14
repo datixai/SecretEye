@@ -1,0 +1,64 @@
+rules_version = '2';
+
+// SecretEye Firestore security rules.
+//  - Homeowners (mobile app) can only see and change their own data.
+//  - Admins (admin website) have users/{uid}.role == "admin" and can manage everything.
+//  - The Python backend uses the Admin SDK, which bypasses these rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+    function unchanged(field) {
+      return !(field in request.resource.data) && !(field in resource.data)
+        || (field in resource.data && field in request.resource.data && request.resource.data[field] == resource.data[field]);
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      // Self-signup can only ever create a homeowner account.
+      allow create: if isOwner(uid) && request.resource.data.role == "homeowner"
+                    && !("disabled" in request.resource.data);
+      // Homeowners may edit their profile but never their role or disabled flag.
+      allow update: if (isOwner(uid) && unchanged("role") && unchanged("disabled")) || isAdmin();
+      allow delete: if isOwner(uid) || isAdmin();
+    }
+
+    match /settings/{uid} {
+      allow read, write: if isOwner(uid) || isAdmin();
+    }
+
+    match /devices/{id} {
+      allow read, update, delete: if isOwner(resource.data.userId) || isAdmin();
+      allow create: if isOwner(request.resource.data.userId) || isAdmin();
+    }
+
+    match /detections/{id} {
+      allow read, delete: if isOwner(resource.data.userId) || isAdmin();
+      // Homeowners can only mark alerts reviewed; detections are created by the backend.
+      allow update: if (isOwner(resource.data.userId)
+                        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status"]))
+                    || isAdmin();
+      allow create: if isAdmin();
+    }
+
+    match /trusted_visitors/{id} {
+      allow read, update, delete: if isOwner(resource.data.homeownerId) || isAdmin();
+      allow create: if isOwner(request.resource.data.homeownerId) || isAdmin();
+    }
+
+    match /emergency_alerts/{id} {
+      allow read: if isOwner(resource.data.userId) || isAdmin();
+      allow create: if isOwner(request.resource.data.userId) && request.resource.data.status == "open";
+      // Homeowners can only cancel their own alert; admins acknowledge/resolve.
+      allow update: if (isOwner(resource.data.userId) && request.resource.data.status == "resolved")
+                    || isAdmin();
+      allow delete: if isAdmin();
+    }
+  }
+}

@@ -1,114 +1,60 @@
-# ===========================
-# SECRETS — NEVER COMMIT
-# ===========================
+# ── Secrets ──────────────────────────────────────────
 backend/serviceAccountKey.json
-lib/firebase.js
 .env
 .env.local
-.env.*.local
-
-# ===========================
-# PYTHON — ALL VIRTUAL ENVS & CACHE
-# ===========================
-venv/
-.venv/
-env/
-ENV/
-backend/venv/
-backend/.venv/
-__pycache__/
-**/__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-*.egg-info/
-*.egg
-dist/
-build/
-backend/.deepface/
-.vscode
-
-# ===========================
-# AI MODELS (too large for GitHub)
-# Place weapon.pt, fight.pt inside backend/model/
-# ===========================
-*.pt
-*.h5
-*.pb
-*.onnx
-*.weights
-
-# ===========================
-# NODE / JAVASCRIPT
-# ===========================
-node_modules/
-**/node_modules/
-npm-debug.*
-yarn-debug.*
-yarn-error.*
-package-lock.json
-
-# ===========================
-# EXPO
-# ===========================
-.expo/
-dist/
-web-build/
-expo-env.d.ts
-
-# ===========================
-# NATIVE BUILD FOLDERS
-# ===========================
-/android/
-/ios/
-.kotlin/
-
-# ===========================
-# TYPESCRIPT
-# ===========================
-*.tsbuildinfo
-
-# ===========================
-# CERTIFICATES & KEYS
-# ===========================
+**/.env
+**/.env.local
 *.jks
+*.keystore
 *.p8
 *.p12
 *.key
-*.mobileprovision
 *.pem
 
-# ===========================
-# OS FILES
-# ===========================
-.DS_Store
-.DS_Store?
-Thumbs.db
-ehthumbs.db
+# ── Local archive (not in git) ──────────────────────
+_old_poc/
 
-# ===========================
-# EDITOR
-# ===========================
-.vscode/settings.json
-.idea/
-
-# ===========================
-# MISC
-# ===========================
-.metro-health-check*
-app-example/
+# ── Node / Expo / Vite ──────────────────────────────
+node_modules/
+**/node_modules/
+.expo/
+dist/
+web-build/
+mobile/expo-env.d.ts
+mobile/android/
+mobile/ios/
+*.tsbuildinfo
+npm-debug.*
 *.log
 
-# ===========================
-# ML MODELS
-# ===========================
-ml_models/
+# ── Python ──────────────────────────────────────────
+venv/
+.venv/
+__pycache__/
+*.py[cod]
 
-# ===========================
-# BACKEND — VIDEOS & OUTPUTS
-# ===========================
+# ── AI models & runtime output ──────────────────────
+*.pt
+*.h5
+*.onnx
+*.tflite
+backend/model/
+backend/faces/
 backend/video/
 backend/runs/
 backend/uploads_tmp/
-backend/faces/
+
+# ── Firebase ────────────────────────────────────────
+firebase/.firebase/
+firebase-debug.log
+
+# ── OS / editor ─────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ── Local tooling / logs ─────────────────────────────
+.claude/
+*.log
+marketing/reel/out/
